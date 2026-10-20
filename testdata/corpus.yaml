@@ -1,0 +1,18 @@
+# Synthetic corpus. Media bytes are produced by testdata/generate_synthetic.py
+# and are not committed. Scenarios refer to these URIs.
+items:
+  - id: local-1080p-h264
+    uri: corpus://startup/local-1080p-h264
+    container: mp4
+    video_codec: h264
+    width: 1920
+    height: 1080
+    duration_s: 60
+  - id: portrait-1080p-hevc
+    uri: corpus://feed/portrait-1080p-hevc/*
+    container: mp4
+    video_codec: hevc
+    width: 1080
+    height: 1920
+    count: 30
+    duration_s: 60

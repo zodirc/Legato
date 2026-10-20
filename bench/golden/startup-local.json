@@ -1,0 +1,15 @@
+{
+  "scenario": {"id": "startup-local", "hash": "sha256:1c311490b60c06df8b50c2bd92ddc0522f24a329327bb45b7ee6bae2df268fa9"},
+  "build": {"commit": "GIT", "config": "skeleton", "ffmpeg": "none", "quirks_db": "none"},
+  "env": {"tier": "T1", "device": "headless", "os": "linux", "backend": "legato", "model": "headless-skeleton", "preset": "vod", "simulated_network": false, "network_trace": ""},
+  "runs": 1,
+  "metrics": {
+    "first_frame_ms": {"unit": "ms", "samples": [120], "p50": 120, "p90": 120},
+    "first_frame_breakdown": {"unit": "us", "probe": 40000, "first_packet": 0, "decoder_open": 50000, "first_frame_decoded": 20000, "first_frame_presented": 10000, "cache_hit": false, "decoder_reused": false},
+    "stall_ratio": {"unit": "ratio", "value": 0.000000},
+    "alloc_steady": {"unit": "count", "value": 0},
+    "av_sync_ms": {"unit": "ms", "p95": 0}
+  },
+  "events": ["state_changed", "first_frame", "state_changed"],
+  "gates": {"alloc_steady_eq_0": true, "av_sync_p95_lt_40ms": true}
+}

@@ -1,0 +1,22 @@
+id: feed-swipe-4g
+preset: short_video
+tier: T1
+media:
+  playlist: corpus://feed/portrait-1080p-hevc/*
+  count: 30
+network:
+  trace: traces/4g-urban-01.json
+  rtt_ms: 60
+repetitions: 1
+warmup: 0
+metrics:
+  - first_frame_ms
+  - stall_ratio
+  - alloc_steady
+  - decoder_reuse_rate
+actions:
+  - repeat: 30
+    steps:
+      - wait_first_frame
+      - watch: 3s
+      - swipe_next

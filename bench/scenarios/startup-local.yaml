@@ -1,0 +1,18 @@
+id: startup-local
+preset: vod
+tier: T1
+media:
+  uri: corpus://startup/local-1080p-h264
+repetitions: 1
+warmup: 0
+metrics:
+  - first_frame_ms
+  - first_frame_breakdown
+  - stall_ratio
+  - alloc_steady
+  - av_sync_ms
+actions:
+  - load
+  - play
+  - wait_first_frame
+  - watch: 5s
