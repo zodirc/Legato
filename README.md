@@ -205,7 +205,7 @@ python3 tools/idlgen/idlgen.py --check
 - `api/`：C ABI 实现。
 - `bench/`：回归场景与基线。
 - `examples/play.c`：本地文件播放。`examples/hello.c`：确定性回归示例。
-- `docs/wiki/`：流程架构导览。在该目录执行 `python3 -m http.server` 后打开 `index.html`。
+- `docs/wiki/`：流程架构导览。在线地址是 https://zodirc.github.io/Legato/wiki/ 。Pages 源选择 GitHub Actions，由 `.github/workflows/docs-pages.yml` 发布 `docs/`。
 - `testdata/corpus.yaml`：确定性回归用例清单。
 
 ### 3.3 示例进程的超时

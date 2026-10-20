@@ -69,7 +69,7 @@ description: >-
 > 基于路径：`Legato`
 ```
 
-修改文档行为时同步更新日期。不链接被忽略的设计稿。流程架构导览放在 `docs/wiki/`，用浏览器打开 `docs/wiki/index.html`。
+修改文档行为时同步更新日期。不链接被忽略的设计稿。流程架构导览放在 `docs/wiki/`。在线站点由 `.github/workflows/docs-pages.yml` 把 `docs/` 发布到 GitHub Pages，入口是 `https://zodirc.github.io/Legato/wiki/`。不要把 GitHub 文件视图里的 HTML 源码当作导览。
 
 ## 流程图
 
