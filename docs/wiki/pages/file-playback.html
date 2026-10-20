@@ -1,0 +1,17 @@
+<section class="page" data-id="file-playback" data-group="流程" data-title="本地播放">
+  <div class="card">
+    <h2>本地文件播放</h2>
+    <p class="lede">管线为 <code>FileSource</code> → <code>FFmpegDemuxer</code> → <code>FFmpegSwDecoder</code> → <code>AlsaSink</code>。解码线程在会话生命周期内只创建一次。控制线程只改标志。</p>
+    <h3>1. 打开与读包</h3>
+    <p><code>FFmpegDemuxer</code> 使用 <code>AVFMT_FLAG_CUSTOM_IO</code>，字节来自 <code>DataSource</code>。存在音频流时必须打开 ALSA PCM 设备，输出为交错 S16，采样率取协商结果。无音频流时按视频 PTS 调度，视频帧在 <code>receive</code> 后释放，不送显示 Sink。</p>
+    <h3>2. 主时钟与流结束</h3>
+    <p>音频主时钟为 <code>origin_us + (written_frames - snd_pcm_delay) * 1000000 / rate</code>。首次写入成功调用 <code>media_first_frame</code>，<code>state</code> 转为 <code>playing</code>。EOF 之后取出重采样残余样本，再 <code>snd_pcm_drain</code>。drain 期间若暂停或 Seek 已经置位，不发送 EOS。</p>
+    <h3>3. 传输控制</h3>
+    <p>暂停调用 <code>AlsaSink::drop</code>。设备欠载才 <code>snd_pcm_recover</code>。<code>stop_and_join</code> 不能在持有 <code>Player::mu_</code> 时执行，因为 <code>media_first_frame</code> 需要同一把锁。</p>
+    <p class="src"><code>FilePlayback::open</code> · <code>run</code> · <code>engine/src/file_playback.cpp</code></p>
+  </div>
+  <figure class="figure">
+    <img src="../assets/file-playback-zh.png" alt="本地文件播放主链" width="1536" height="1024" />
+    <figcaption>本地文件播放主链 · 点击放大</figcaption>
+  </figure>
+</section>

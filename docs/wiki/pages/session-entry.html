@@ -1,0 +1,15 @@
+<section class="page" data-id="session-entry" data-group="流程" data-title="会话入口">
+  <div class="card">
+    <h2>会话入口</h2>
+    <p class="lede"><code>legato_player_load</code> 在控制线程上执行完才返回。返回值 0 表示命令已受理，不表示媒体已经打开。</p>
+    <h3>1. 分发</h3>
+    <p><code>Player::load_locked</code> 读取 <code>legato_media_item.uri</code>。<code>corpus:</code> 进入确定性回归。<code>file://</code> 与无 scheme 的路径进入 <code>FilePlayback::open</code>。其它带 <code>://</code> 的 scheme 将 <code>state</code> 置为 <code>error</code>，<code>message</code> 为「这个协议还不能播」。</p>
+    <h3>2. 打开结果</h3>
+    <p>打开成功时 <code>state=loading</code>。若 <code>playing_intent_</code> 已经置位，<code>FilePlayback::start</code> 立即启动解码线程。打开失败时释放 <code>playback_</code>，<code>file_mode_=false</code>，<code>state=error</code>。空 URI、超长路径分别对应「uri 为空」和「路径太长」。</p>
+    <p class="src"><code>Player::load_uri</code> · <code>local_path</code> · <code>load_locked</code> · <code>engine/src/player.cpp</code></p>
+  </div>
+  <figure class="figure">
+    <img src="../assets/session-entry-zh.png" alt="会话入口详流" width="1536" height="1024" />
+    <figcaption>会话入口详流 · 点击放大</figcaption>
+  </figure>
+</section>

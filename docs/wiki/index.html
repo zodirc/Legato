@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Legato · 流程架构</title>
+  <style>
+    :root, [data-theme="paper"] {
+      --bg: #e8edf2; --paper: #fff; --ink: #15202b; --muted: #5c6b7a; --line: #d5dde6;
+      --accent: #0f766e; --accent-soft: #ccfbf1; --code-bg: #f1f5f9;
+      --sidebar: #111827; --sidebar-text: #cbd5e1; --sidebar-muted: #94a3b8;
+      --sidebar-active: #f8fafc; --sidebar-accent: #2dd4bf;
+      --topbar: rgba(255,255,255,.9); --shadow: 0 10px 28px rgba(15,23,42,.06);
+      color-scheme: light;
+    }
+    [data-theme="ink"] {
+      --bg: #12161e; --paper: #1a202b; --ink: #e6edf3; --muted: #93a0b0; --line: #2a3342;
+      --accent: #2dd4bf; --accent-soft: rgba(45,212,191,.12); --code-bg: #12171f;
+      --sidebar: #0d1118; --sidebar-text: #b7c2cf; --sidebar-muted: #7d8a99;
+      --sidebar-active: #f0fdfa; --sidebar-accent: #2dd4bf;
+      --topbar: rgba(18,22,30,.9); --shadow: 0 12px 32px rgba(0,0,0,.28);
+      color-scheme: dark;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      display: grid; grid-template-columns: 260px 1fr; grid-template-rows: 52px 1fr;
+      background: var(--bg); color: var(--ink);
+      font: 16px/1.55 ui-sans-serif, system-ui, "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .sidebar { grid-row: 1 / span 2; background: var(--sidebar); color: var(--sidebar-text); padding: 1rem .8rem; overflow: auto; }
+    .brand { color: var(--sidebar-active); font-weight: 700; letter-spacing: -.02em; }
+    .brand small { display: block; color: var(--sidebar-muted); font-weight: 500; font-size: .78rem; }
+    .nav-group-title { margin: 1rem 0 .35rem; color: var(--sidebar-muted); font-size: .72rem; letter-spacing: .08em; }
+    .nav button {
+      display: block; width: 100%; text-align: left; border: 0; background: transparent;
+      color: var(--sidebar-text); padding: .4rem .55rem; border-radius: 8px; cursor: pointer; font: inherit;
+    }
+    .nav button.active { background: rgba(45,212,191,.16); color: var(--sidebar-active); }
+    .topbar {
+      display: flex; align-items: center; gap: .6rem; padding: 0 1rem;
+      background: var(--topbar); border-bottom: 1px solid var(--line); position: sticky; top: 0;
+    }
+    .topbar .grow { flex: 1; color: var(--muted); font-size: .85rem; }
+    .topbar button {
+      border: 1px solid var(--line); background: var(--paper); color: var(--ink);
+      border-radius: 8px; padding: .25rem .55rem; cursor: pointer; font: inherit;
+    }
+    main { overflow: auto; padding: 1.2rem 1.4rem 2rem; }
+    .page { display: none; max-width: 920px; }
+    .page.active { display: block; }
+    .card { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.15rem; box-shadow: var(--shadow); }
+    h2 { margin: 0 0 .4rem; font-size: 1.35rem; letter-spacing: -.02em; }
+    h3 { margin: 1rem 0 .3rem; font-size: 1rem; }
+    p { margin: .4rem 0; }
+    .lede { color: var(--ink); }
+    code { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; font-size: .86em; background: var(--code-bg); padding: .05rem .3rem; border-radius: 4px; }
+    .src { color: var(--muted); font-size: .82rem; }
+    .figure { margin: .8rem 0 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--paper); }
+    .figure img { display: block; width: 100%; height: auto; background: #fff; cursor: zoom-in; }
+    .figure figcaption { padding: .45rem .7rem; color: var(--muted); font-size: .78rem; border-top: 1px solid var(--line); }
+    .figure.zoomed { position: fixed; inset: .6rem; z-index: 20; margin: 0; display: flex; flex-direction: column; background: #0d1118; }
+    .figure.zoomed img { flex: 1; object-fit: contain; cursor: zoom-out; background: #0d1118; }
+    .figure.zoomed figcaption { color: #cbd5e1; background: #0d1118; border-color: #1f2937; }
+    #loadMsg { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">Legato<small>流程架构 · 初步</small></div>
+    <nav id="nav"></nav>
+  </aside>
+  <header class="topbar">
+    <button type="button" id="prev">上一页</button>
+    <button type="button" id="next">下一页</button>
+    <span class="grow" id="crumb"></span>
+    <button type="button" id="theme">外观</button>
+  </header>
+  <main>
+    <p id="loadMsg">正在载入章节。</p>
+    <div id="content"></div>
+  </main>
+  <script>
+    const FILES = ["overview", "session-entry", "file-playback", "deterministic"];
+    const content = document.getElementById("content");
+    const nav = document.getElementById("nav");
+    const crumb = document.getElementById("crumb");
+    const THEME_KEY = "legato.wiki.theme";
+
+    function applyTheme(id) {
+      document.documentElement.setAttribute("data-theme", id);
+      try { localStorage.setItem(THEME_KEY, id); } catch (e) {}
+    }
+    try {
+      applyTheme(localStorage.getItem(THEME_KEY) || "paper");
+    } catch (e) { applyTheme("paper"); }
+
+    document.getElementById("theme").addEventListener("click", () => {
+      const cur = document.documentElement.getAttribute("data-theme");
+      applyTheme(cur === "ink" ? "paper" : "ink");
+    });
+
+    let pages = [];
+    let idx = 0;
+
+    function go(n) {
+      idx = Math.max(0, Math.min(pages.length - 1, n));
+      pages.forEach((p, i) => p.classList.toggle("active", i === idx));
+      nav.querySelectorAll("button[data-i]").forEach((b) => {
+        b.classList.toggle("active", Number(b.dataset.i) === idx);
+      });
+      const p = pages[idx];
+      crumb.textContent = (p.dataset.group || "") + " · " + (p.dataset.title || "");
+      location.hash = p.dataset.id;
+    }
+
+    content.addEventListener("click", (ev) => {
+      const fig = ev.target.closest(".figure");
+      if (!fig) return;
+      fig.classList.toggle("zoomed");
+    });
+    document.getElementById("prev").addEventListener("click", () => go(idx - 1));
+    document.getElementById("next").addEventListener("click", () => go(idx + 1));
+
+    (async function () {
+      try {
+        const htmls = await Promise.all(FILES.map(async (id) => {
+          const r = await fetch("pages/" + id + ".html", { cache: "no-store" });
+          if (!r.ok) throw new Error(id + " HTTP " + r.status);
+          return r.text();
+        }));
+        content.innerHTML = htmls.join("\n");
+        document.getElementById("loadMsg").remove();
+        pages = Array.from(content.querySelectorAll(".page"));
+        let last = "";
+        pages.forEach((p, i) => {
+          const g = p.dataset.group || "其他";
+          if (g !== last) {
+            const t = document.createElement("div");
+            t.className = "nav-group-title";
+            t.textContent = g;
+            nav.appendChild(t);
+            last = g;
+          }
+          const b = document.createElement("button");
+          b.type = "button";
+          b.dataset.i = String(i);
+          b.textContent = p.dataset.title || p.dataset.id;
+          b.addEventListener("click", () => go(i));
+          nav.appendChild(b);
+        });
+        const want = location.hash.replace("#", "");
+        const found = pages.findIndex((p) => p.dataset.id === want);
+        go(found >= 0 ? found : 0);
+      } catch (err) {
+        document.getElementById("loadMsg").textContent =
+          "章节未能载入：" + err + "。在 docs/wiki 下执行 python3 -m http.server，再用浏览器打开。";
+      }
+    })();
+  </script>
+</body>
+</html>

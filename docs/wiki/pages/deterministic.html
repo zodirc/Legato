@@ -1,0 +1,15 @@
+<section class="page" data-id="deterministic" data-group="流程" data-title="确定性回归">
+  <div class="card">
+    <h2>确定性回归</h2>
+    <p class="lede"><code>corpus://</code> 是用例标识，不映射到文件系统。该路径不创建 <code>FileSource</code>、解复用器、解码器和 <code>AlsaSink</code>，也不输出 PCM。</p>
+    <h3>1. 虚拟媒体时钟</h3>
+    <p><code>load_locked</code> 将 <code>state</code> 置为 <code>loading</code>，并按预设登记首帧定时器。点播 120ms，短视频冷启动 100ms，解码器复用 80ms。时钟只在 <code>legato_engine_advance_us</code> 被调用时前进。到期后发送 <code>first_frame</code>，<code>state</code> 转为 <code>playing</code>。</p>
+    <h3>2. 基线</h3>
+    <p><code>legato-bench</code> 将结果与 <code>bench/golden/</code> 比对。结果字段 <code>model</code> 的字面量是 <code>headless-skeleton</code>，表示基线来自虚拟媒体时钟。进入稳态后 <code>alloc_steady</code> 的门禁为 0。基线时延是预设常量，不回写本地播放的实测值。两条路径的时间基相互独立。</p>
+    <p class="src"><code>examples/hello.c</code> · <code>bench/src/bench_main.cpp</code> · <code>bench/golden/</code></p>
+  </div>
+  <figure class="figure">
+    <img src="../assets/deterministic-zh.png" alt="确定性回归详流" width="1536" height="1024" />
+    <figcaption>确定性回归详流 · 点击放大</figcaption>
+  </figure>
+</section>
