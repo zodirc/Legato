@@ -1,0 +1,25 @@
+---
+description: 文档流程图用主链详流。先对照样板再画；禁止 Mermaid 和卡片堆；整张 PNG
+globs: docs/**
+alwaysApply: true
+---
+
+# 文档图：主链详流
+
+仓库 `docs/wiki/assets/**/*.png` 是控制流详图。样板：
+
+`docs/wiki/assets/file-playback-zh.png`
+
+名词、口吻和页结构以 `.cursor/skills/legato-writing/SKILL.md` 为准。
+
+## 出图
+
+1. 整张重绘为 1536×1024 RGB PNG。禁止在旧图上涂改。
+2. 禁止 Mermaid、Graphviz、等重卡片和 Unicode 箭头脊柱作为正文图。
+3. 冲突时：代码 > 导览正文 > 图上的字。
+
+## 页结构
+
+顶栏居中标题加一行灰副标题。左辅栏是虚线分组里的白格。中主链是宽而矮的条带、左缘编号圆和画出来的箭头。右辅栏是失败或旁路。底栏是红色「要点：」横条，页脚写该 PNG 的相对路径。
+
+判定用黄菱形，出边写「是」「否」。先看见中间的箭头链，再看见左右注。

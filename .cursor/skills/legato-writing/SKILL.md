@@ -2,9 +2,9 @@
 name: legato-writing
 description: >-
   Enforces Legato technical prose for tone, media-engine terminology, code
-  comments, and document structure. Use when writing or editing README, docs,
-  comments, or when the user mentions 口吻, 名词, 注释, 文档风格, documentation,
-  or wording.
+  comments, document structure, and main-chain flowchart PNGs. Use when writing
+  or editing README, docs/wiki, comments, or when the user mentions 口吻, 名词,
+  注释, 文档风格, 流程图, documentation, or wording.
 ---
 
 # Legato 写作标准
@@ -69,7 +69,29 @@ description: >-
 > 基于路径：`Legato`
 ```
 
-修改文档行为时同步更新日期。不链接被忽略的设计稿。
+修改文档行为时同步更新日期。不链接被忽略的设计稿。流程架构导览放在 `docs/wiki/`，用浏览器打开 `docs/wiki/index.html`。
+
+## 流程图
+
+`docs/wiki/assets/**/*.png` 是主链详流，不是说明卡片，也不是信息图。样板是 `docs/wiki/assets/file-playback-zh.png`。新增或替换任何一张图之前，先打开样板对照，不要另起一套皮肤。
+
+一张图固定为五区：
+
+| 区 | 职责 |
+|---|---|
+| 顶 | 居中标题，一行灰色副标题 |
+| 左辅栏 | 入口、触发，或本路径不创建的对象。虚线框里是白底小格 |
+| 中主链 | 一条垂直脊柱。宽而矮的条带、左缘编号圆、画出来的箭头 |
+| 右辅栏 | 失败、旁路、禁止项。不是第二条主链 |
+| 底 | 红色「要点：」横条，用 `｜` 分隔。页脚是该 PNG 的仓库相对路径 |
+
+判定用黄菱形，出边写「是」「否」。读者应先看见中间的箭头链。满页等大色块、只靠文字充当箭头，都要重画。
+
+图内符号、函数名和错误字符串与代码一致。冲突时以代码为准，其次是导览正文，最后才是图上的字。
+
+禁止把下列产物当作正文图：Mermaid、Graphviz、等重卡片循环、Unicode `↓` 脊柱、在旧 PNG 上涂改。替换时整张重绘为 1536×1024 的 RGB PNG。
+
+导览页是 `docs/wiki/pages/*.html` 里的 `<section class="page">`。图放在 `<figure class="figure">` 中，由 `docs/wiki/index.html` 分页加载。图注写「点击放大」。正文用本标准的名词，步骤写调用点和状态，不把图上的句子再抄一遍。
 
 ## 示例
 
