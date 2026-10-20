@@ -1,0 +1,6 @@
+LEGATO_1.0 {
+  global:
+    legato_*;
+  local:
+    *;
+};
