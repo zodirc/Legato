@@ -1,0 +1,22 @@
+# Same dictionary for the bench, the lab, and later online reports.
+metrics:
+  - name: first_frame_ms
+    unit: ms
+  - name: first_frame_breakdown
+    unit: us
+  - name: stall_ratio
+    unit: ratio
+  - name: av_sync_ms
+    unit: ms
+    gate: p95_lt_40
+  - name: alloc_steady
+    unit: count
+    gate: eq_0
+  - name: decoder_reuse_rate
+    unit: ratio
+  - name: dropped_frames
+    unit: count
+  - name: cpu_time
+    unit: ms
+  - name: peak_rss
+    unit: bytes

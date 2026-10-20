@@ -1,0 +1,8 @@
+events:
+  - name: state_changed
+  - name: first_frame
+  - name: ended
+  - name: error
+  - name: metrics
+  - name: seek
+  - name: decoder_fallback

@@ -1,0 +1,10 @@
+# Closed sets used by the C ABI. Append-only within a major version.
+enums:
+  - name: state
+    values: idle, loading, ready, playing, buffering, ended, error
+  - name: seek_mode
+    values: precise, keyframe, nearest
+  - name: event_type
+    values: none, state_changed, first_frame, ended, error, metrics, seek, decoder_fallback
+  - name: render_api
+    values: none, gl, metal, d3d11, vulkan

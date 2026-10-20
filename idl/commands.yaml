@@ -1,0 +1,6 @@
+commands:
+  - name: load
+  - name: play
+  - name: pause
+  - name: seek
+  - name: stop

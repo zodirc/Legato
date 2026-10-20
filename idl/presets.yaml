@@ -1,0 +1,56 @@
+# Numbers marked placeholder are not in the design doc; M1 calibrates them on the bench.
+presets:
+  - name: vod
+    buffer_start_s: 1.5
+    buffer_resume_s: 3
+    buffer_max_s: 50
+    live_target_latency_s: 0
+    exact_seek: true
+    preload_ahead: 0
+    preload_behind: 0
+    video: true
+  - name: short_video
+    buffer_start_s: 0.3
+    buffer_resume_s: 1.0
+    buffer_max_s: 15
+    live_target_latency_s: 0
+    exact_seek: false
+    preload_ahead: 2
+    preload_behind: 1
+    video: true
+  - name: live
+    buffer_start_s: 1.5
+    buffer_resume_s: 1.5
+    buffer_max_s: 8
+    live_target_latency_s: 3
+    exact_seek: false
+    preload_ahead: 0
+    preload_behind: 0
+    video: true
+  - name: live_low_latency
+    buffer_start_s: 0.5
+    buffer_resume_s: 0.5
+    buffer_max_s: 2
+    live_target_latency_s: 1
+    exact_seek: false
+    preload_ahead: 0
+    preload_behind: 0
+    video: true
+  - name: music
+    buffer_start_s: 1.5
+    buffer_resume_s: 3
+    buffer_max_s: 50
+    live_target_latency_s: 0
+    exact_seek: true
+    preload_ahead: 1
+    preload_behind: 0
+    video: false
+  - name: realtime
+    buffer_start_s: 0.15
+    buffer_resume_s: 0.15
+    buffer_max_s: 0.4
+    live_target_latency_s: 0
+    exact_seek: false
+    preload_ahead: 0
+    preload_behind: 0
+    video: false

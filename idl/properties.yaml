@@ -1,0 +1,29 @@
+# Property names are the wire form used by get / set / observe.
+properties:
+  - name: state
+    type: enum
+    enum: state
+    access: r
+  - name: playing_intent
+    type: bool
+    access: r
+  - name: position_us
+    type: i64
+    access: r
+    hot: true
+  - name: duration_us
+    type: i64
+    access: r
+    hot: true
+  - name: preset
+    type: string
+    access: rw
+  - name: video.output_path
+    type: string
+    access: r
+  - name: serial
+    type: i64
+    access: r
+  - name: last_error
+    type: string
+    access: r
