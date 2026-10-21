@@ -4,6 +4,8 @@
 #include "legato/core/spsc_ring.hpp"
 #include "legato/codec/decoder.hpp"
 #include "legato/demux/demuxer.hpp"
+#include "legato/engine/error_info.hpp"
+#include "legato/engine/uri_path.hpp"
 #include "legato/engine/preset.hpp"
 #include "legato/engine/scheduler.hpp"
 #include "legato/io/data_source.hpp"
@@ -12,6 +14,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -117,9 +120,52 @@ void test_clock_and_presets() {
     CHECK(second >= first);
     const legato::PresetDesc* vod = legato::find_preset("vod");
     CHECK(vod != nullptr && vod->buffer_max_s == 50.0);
+    CHECK(vod->exact_seek);
+    CHECK(vod->video);
+    CHECK(legato::find_preset("short_video")->exact_seek == false);
+    CHECK(legato::find_preset("music")->video == false);
     CHECK(legato::find_preset("short_video")->preload_ahead == 2);
     CHECK(legato::find_preset("missing") == nullptr);
     CHECK(std::strcmp(legato::default_preset()->name, "vod") == 0);
+}
+
+void test_errors() {
+    struct Expect {
+        const char* name;
+        const char* category;
+        bool retryable;
+    };
+    const Expect rows[] = {
+        {"ok", "internal", false},
+        {"invalid_argument", "policy", false},
+        {"unsupported", "policy", false},
+        {"source_open_failed", "source", false},
+        {"unsupported_scheme", "source", false},
+        {"demux_failed", "demux", false},
+        {"seek_failed", "demux", false},
+        {"decode_failed", "decode", false},
+        {"audio_device_unavailable", "audio_device", false},
+    };
+    for (const Expect& row : rows) {
+        const legato::ErrorInfo* info = legato::error_info(row.name);
+        CHECK(info != nullptr);
+        if (info == nullptr) {
+            continue;
+        }
+        CHECK(std::strcmp(info->category, row.category) == 0);
+        CHECK(info->retryable == row.retryable);
+    }
+    CHECK(legato::error_info("missing") == nullptr);
+    char path[64];
+    CHECK(legato::local_file_path("file:///tmp/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/a.mp4") == 0);
+    CHECK(legato::local_file_path("file://localhost/tmp/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/a.mp4") == 0);
+    CHECK(legato::local_file_path("file:///C:/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "C:/a.mp4") == 0);
+    CHECK(legato::local_file_path("file://server/share/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "//server/share/a.mp4") == 0);
+    CHECK(legato::local_file_path("corpus://startup/local-1080p-h264", path, sizeof(path)) == 0);
 }
 
 }  /* namespace */
@@ -131,6 +177,7 @@ int main() {
     test_scheduler();
     test_alloc();
     test_clock_and_presets();
+    test_errors();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d checks failed\n", g_failures);
         return 1;
