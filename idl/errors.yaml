@@ -2,12 +2,45 @@ errors:
   - name: ok
     code: 0
     category: internal
+    retryable: false
     hint: ""
   - name: invalid_argument
     code: -1
     category: policy
+    retryable: false
     hint: "检查调用参数。字符串不能为空；公开结构体的 struct_size 必须是调用方编译时的 sizeof。"
   - name: unsupported
     code: -2
     category: policy
-    hint: "当前构建是 M0 骨架，这个入口还没有媒体实现。播放、渲染和抽头会在后续里程碑接上。"
+    retryable: false
+    hint: "当前支持的 scheme 是 file 和 corpus。"
+  - name: source_open_failed
+    code: -3
+    category: source
+    retryable: false
+    hint: "确认路径存在，并且进程有读权限。corpus:// 还要核对 testdata/corpus.yaml 里的内容哈希。"
+  - name: unsupported_scheme
+    code: -4
+    category: source
+    retryable: false
+    hint: "当前支持的 scheme 是 file 和 corpus。"
+  - name: demux_failed
+    code: -5
+    category: demux
+    retryable: false
+    hint: "容器无法识别，或读取中途失败。确认文件完整。"
+  - name: seek_failed
+    code: -6
+    category: demux
+    retryable: false
+    hint: "这个源不能定位，或目标超出时长。"
+  - name: decode_failed
+    code: -7
+    category: decode
+    retryable: false
+    hint: "解码器打不开，或这一帧无法解出。"
+  - name: audio_device_unavailable
+    code: -8
+    category: audio_device
+    retryable: false
+    hint: "没有可用的 PCM 播放设备。检查 ALSA 设备 default、plughw:0,0、hw:0,0。"

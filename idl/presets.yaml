@@ -1,4 +1,22 @@
 # Numbers marked placeholder are not in the design doc; M1 calibrates them on the bench.
+# read_by names the component that reads the field. pending means nothing reads it yet.
+fields:
+  - name: buffer_start_s
+    read_by: FilePlayback::buffered_span_us
+  - name: buffer_resume_s
+    read_by: FilePlayback::note_resumed
+  - name: buffer_max_s
+    read_by: PacketQueue::put
+  - name: live_target_latency_s
+    read_by: pending
+  - name: exact_seek
+    read_by: Player::default_seek_mode
+  - name: preload_ahead
+    read_by: pending
+  - name: preload_behind
+    read_by: pending
+  - name: video
+    read_by: FilePlayback::open
 presets:
   - name: vod
     buffer_start_s: 1.5

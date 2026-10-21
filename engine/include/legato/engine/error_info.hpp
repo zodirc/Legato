@@ -9,6 +9,7 @@ struct ErrorInfo {
     const char* name;
     int code;
     const char* category;
+    bool retryable;
     const char* hint;
 };
 

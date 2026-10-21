@@ -53,6 +53,8 @@ typedef enum legato_event_type {
     LEGATO_EVENT_TYPE_METRICS = 5,
     LEGATO_EVENT_TYPE_SEEK = 6,
     LEGATO_EVENT_TYPE_DECODER_FALLBACK = 7,
+    LEGATO_EVENT_TYPE_COMMAND_DONE = 8,
+    LEGATO_EVENT_TYPE_PROPERTY_CHANGED = 9,
 } legato_event_type;
 
 static inline const char* legato_event_type_name(int value) {
@@ -65,6 +67,8 @@ static inline const char* legato_event_type_name(int value) {
     case LEGATO_EVENT_TYPE_METRICS: return "metrics";
     case LEGATO_EVENT_TYPE_SEEK: return "seek";
     case LEGATO_EVENT_TYPE_DECODER_FALLBACK: return "decoder_fallback";
+    case LEGATO_EVENT_TYPE_COMMAND_DONE: return "command_done";
+    case LEGATO_EVENT_TYPE_PROPERTY_CHANGED: return "property_changed";
     default: return "unknown";
     }
 }
@@ -120,5 +124,11 @@ static inline const char* legato_render_api_name(int value) {
 #define LEGATO_ERR_OK 0
 #define LEGATO_ERR_INVALID_ARGUMENT -1
 #define LEGATO_ERR_UNSUPPORTED -2
+#define LEGATO_ERR_SOURCE_OPEN_FAILED -3
+#define LEGATO_ERR_UNSUPPORTED_SCHEME -4
+#define LEGATO_ERR_DEMUX_FAILED -5
+#define LEGATO_ERR_SEEK_FAILED -6
+#define LEGATO_ERR_DECODE_FAILED -7
+#define LEGATO_ERR_AUDIO_DEVICE_UNAVAILABLE -8
 
 #endif /* LEGATO_IDL_H */
