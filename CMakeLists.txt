@@ -46,14 +46,30 @@ target_include_directories(legato_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/codec/include
   ${CMAKE_CURRENT_SOURCE_DIR}/render/include
 )
-target_compile_options(legato_core PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
+if(MSVC)
+  target_compile_options(legato_core PRIVATE /W4)
+else()
+  target_compile_options(legato_core PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
+endif()
 target_link_libraries(legato_core PUBLIC Threads::Threads)
 
 set(LEGATO_FFMPEG_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg/dist" CACHE PATH
     "Prefix of a static LGPL FFmpeg built with play-demo or play-min")
 set(LEGATO_HAS_FFMPEG OFF)
-if(EXISTS "${LEGATO_FFMPEG_PREFIX}/lib/libavformat.a")
+if(EXISTS "${LEGATO_FFMPEG_PREFIX}/lib/libavformat.a" OR EXISTS "${LEGATO_FFMPEG_PREFIX}/lib/avformat.lib")
   set(LEGATO_HAS_FFMPEG ON)
+endif()
+set(LEGATO_AVFORMAT "${LEGATO_FFMPEG_PREFIX}/lib/libavformat.a")
+set(LEGATO_AVCODEC "${LEGATO_FFMPEG_PREFIX}/lib/libavcodec.a")
+set(LEGATO_SWRESAMPLE "${LEGATO_FFMPEG_PREFIX}/lib/libswresample.a")
+set(LEGATO_SWSCALE "${LEGATO_FFMPEG_PREFIX}/lib/libswscale.a")
+set(LEGATO_AVUTIL "${LEGATO_FFMPEG_PREFIX}/lib/libavutil.a")
+if(EXISTS "${LEGATO_FFMPEG_PREFIX}/lib/avformat.lib")
+  set(LEGATO_AVFORMAT "${LEGATO_FFMPEG_PREFIX}/lib/avformat.lib")
+  set(LEGATO_AVCODEC "${LEGATO_FFMPEG_PREFIX}/lib/avcodec.lib")
+  set(LEGATO_SWRESAMPLE "${LEGATO_FFMPEG_PREFIX}/lib/swresample.lib")
+  set(LEGATO_SWSCALE "${LEGATO_FFMPEG_PREFIX}/lib/swscale.lib")
+  set(LEGATO_AVUTIL "${LEGATO_FFMPEG_PREFIX}/lib/avutil.lib")
 endif()
 
 add_library(legato SHARED
@@ -68,23 +84,35 @@ if(LEGATO_HAS_FFMPEG)
   target_sources(legato PRIVATE
     demux/src/ffmpeg_demuxer.cpp
     codec/src/ffmpeg_sw_decoder.cpp
-    render/src/alsa_sink.cpp
   )
   target_compile_definitions(legato PRIVATE LEGATO_HAS_FFMPEG=1)
   target_include_directories(legato PRIVATE "${LEGATO_FFMPEG_PREFIX}/include")
   target_link_libraries(legato PRIVATE
-    "${LEGATO_FFMPEG_PREFIX}/lib/libavformat.a"
-    "${LEGATO_FFMPEG_PREFIX}/lib/libavcodec.a"
-    "${LEGATO_FFMPEG_PREFIX}/lib/libswresample.a"
-    "${LEGATO_FFMPEG_PREFIX}/lib/libswscale.a"
-    "${LEGATO_FFMPEG_PREFIX}/lib/libavutil.a"
-    /usr/lib64/libasound.so.2
-    m
+    "${LEGATO_AVFORMAT}"
+    "${LEGATO_AVCODEC}"
+    "${LEGATO_SWRESAMPLE}"
+    "${LEGATO_SWSCALE}"
+    "${LEGATO_AVUTIL}"
   )
+  if(NOT MSVC)
+    target_link_libraries(legato PRIVATE m)
+  endif()
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_library(LEGATO_ASOUND asound)
+  if(LEGATO_HAS_FFMPEG AND LEGATO_ASOUND)
+    target_sources(legato PRIVATE render/src/alsa_sink.cpp)
+    target_compile_definitions(legato PRIVATE LEGATO_HAS_ALSA=1)
+    target_link_libraries(legato PRIVATE "${LEGATO_ASOUND}")
+  endif()
 endif()
 target_include_directories(legato PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(legato PRIVATE LEGATO_BUILDING)
-target_compile_options(legato PRIVATE -Wall -Wextra -Wpedantic)
+if(MSVC)
+  target_compile_options(legato PRIVATE /W4)
+else()
+  target_compile_options(legato PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 target_link_libraries(legato PRIVATE legato_core)
 set_target_properties(legato PROPERTIES
   OUTPUT_NAME legato
