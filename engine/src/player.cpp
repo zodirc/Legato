@@ -1,9 +1,13 @@
 #include "legato/engine/player.hpp"
 
+#include "legato/engine/uri_path.hpp"
+
 #include "legato/core/alloc.hpp"
 #include "legato/core/log.hpp"
+#include "legato/engine/corpus.hpp"
 #include "legato/engine/error_info.hpp"
 #include "legato/engine/file_playback.hpp"
+#include "legato/engine/test_hooks.hpp"
 #include "legato/pal/clock.hpp"
 #include "legato/render/sink.hpp"
 
@@ -11,6 +15,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string>
+#include <utility>
+
+#ifndef LEGATO_SOURCE_DIR
+#define LEGATO_SOURCE_DIR "."
+#endif
 
 namespace legato {
 namespace {
@@ -34,19 +44,47 @@ Player::Player(std::shared_ptr<Engine> engine, const PresetDesc* preset)
     : engine_(std::move(engine)), preset_(preset) {
     id_ = g_player_ids.fetch_add(1, std::memory_order_relaxed);
     std::snprintf(output_path_, sizeof(output_path_), "none");
-    engine_->post_control([this] {
-        std::lock_guard<std::mutex> lock(engine_->mu_);
-        engine_->register_player(this);
+    std::snprintf(trace_id_, sizeof(trace_id_), "p-%016llx", static_cast<unsigned long long>(id_));
+}
+
+void Player::register_self(const std::shared_ptr<Player>& self) {
+    io_ = std::thread([this] { io_main(); });
+    /* 登记只碰引擎名单，不经过 post_and_wait。post_and_wait 只留给虚拟媒体时钟推进。 */
+    std::lock_guard<std::mutex> lock(engine_->mu_);
+    engine_->register_player(self);
+}
+
+/* 调用线程只投递回收。join IO 线程和解码线程在回收线程上完成。 */
+void Player::request_release() {
+    std::shared_ptr<Player> self = shared_from_this();
+    engine_->post([self] {
+        std::lock_guard<std::mutex> lock(self->mu_);
+        self->released_ = true;
+    });
+    engine_->post_reclaim([self] {
+        self->io_stop_.store(true);
+        self->io_cv_.notify_all();
+        if (self->io_.joinable()) {
+            self->io_.join();
+        }
+        if (self->playback_) {
+            self->playback_->stop();
+        }
+        std::lock_guard<std::mutex> lock(self->engine_->mu_);
+        self->engine_->scheduler_.cancel(self->id_);
+        self->engine_->unregister_player(self.get());
     });
 }
 
 Player::~Player() {
-    stop_file();
-    engine_->post_control([this] {
-        std::lock_guard<std::mutex> lock(engine_->mu_);
-        engine_->scheduler_.cancel(id_);
-        engine_->unregister_player(this);
-    });
+    io_stop_.store(true);
+    io_cv_.notify_all();
+    if (io_.joinable()) {
+        io_.join();
+    }
+    if (playback_) {
+        playback_->stop();
+    }
 }
 
 std::uint64_t Player::bump_locked(std::uint64_t* command_id) {
@@ -85,11 +123,63 @@ void Player::dispatch(bool wake) {
     }
 }
 
+bool Player::protected_event(int type) const {
+    return type == LEGATO_EVENT_TYPE_ERROR || type == LEGATO_EVENT_TYPE_ENDED || type == LEGATO_EVENT_TYPE_FIRST_FRAME ||
+           type == LEGATO_EVENT_TYPE_STATE_CHANGED;
+}
+
+bool Player::same_merge(const EventSlot& slot, int type, const char* json) const {
+    if (!slot.live || slot.type != type) {
+        return false;
+    }
+    if (type == LEGATO_EVENT_TYPE_SEEK) {
+        return true;
+    }
+    /* 位置通过 property_changed 发出。同一属性只留最新一条，避免挤掉终态事件。 */
+    if (type != LEGATO_EVENT_TYPE_PROPERTY_CHANGED || json == nullptr) {
+        return false;
+    }
+    const char* key = "\"property\":\"";
+    const char* left = std::strstr(slot.json, key);
+    const char* right = std::strstr(json, key);
+    if (left == nullptr || right == nullptr) {
+        return false;
+    }
+    left += std::strlen(key);
+    right += std::strlen(key);
+    const char* left_end = std::strchr(left, '"');
+    const char* right_end = std::strchr(right, '"');
+    if (left_end == nullptr || right_end == nullptr) {
+        return false;
+    }
+    const std::size_t left_len = static_cast<std::size_t>(left_end - left);
+    const std::size_t right_len = static_cast<std::size_t>(right_end - right);
+    return left_len == right_len && std::memcmp(left, right, left_len) == 0;
+}
+
 void Player::emit_locked(int type, std::int64_t time_us, const char* json) {
+    if (type == LEGATO_EVENT_TYPE_SEEK || type == LEGATO_EVENT_TYPE_PROPERTY_CHANGED) {
+        std::uint32_t index = ev_read_;
+        while (index != ev_write_) {
+            EventSlot& slot = events_[index];
+            if (same_merge(slot, type, json)) {
+                slot.time_us = time_us;
+                copy_json_string(slot.json, sizeof(slot.json), json != nullptr ? json : "{}");
+                wake_ = true;
+                return;
+            }
+            index = (index + 1) % 32;
+        }
+    }
     const std::uint32_t capacity = 32;
     const std::uint32_t next = (ev_write_ + 1) % capacity;
     if (next == ev_read_) {
+        if (protected_event(events_[ev_read_].type) || !protected_event(type)) {
+            ++events_dropped_;
+            return;
+        }
         ev_read_ = (ev_read_ + 1) % capacity;
+        ++events_dropped_;
     }
     EventSlot& slot = events_[ev_write_];
     slot.type = type;
@@ -100,145 +190,169 @@ void Player::emit_locked(int type, std::int64_t time_us, const char* json) {
     wake_ = true;
 }
 
+void Player::complete_command_locked(std::uint64_t command_id, bool ok) {
+    char json[64];
+    std::snprintf(json, sizeof(json), "{\"id\":%llu,\"ok\":%s}", static_cast<unsigned long long>(command_id),
+                  ok ? "true" : "false");
+    emit_locked(LEGATO_EVENT_TYPE_COMMAND_DONE, engine_->scheduler_.now(), json);
+}
+
 void Player::set_error_locked(const char* name, const char* message) {
     const ErrorInfo* info = error_info(name);
     const char* category = info != nullptr ? info->category : "internal";
     const char* hint = info != nullptr && info->hint != nullptr ? info->hint : "";
+    const bool retryable = info != nullptr && info->retryable;
     std::snprintf(last_error_, sizeof(last_error_),
-                  "{\"category\":\"%s\",\"code\":\"%s\",\"retryable\":false,"
-                  "\"message\":\"%s\",\"hint\":\"%s\",\"trace_id\":\"m0\"}",
-                  category, name, message != nullptr ? message : "", hint);
+                  "{\"category\":\"%s\",\"code\":\"%s\",\"retryable\":%s,"
+                  "\"message\":\"%s\",\"hint\":\"%s\",\"trace_id\":\"%s\"}",
+                  category, name, retryable ? "true" : "false", message != nullptr ? message : "", hint, trace_id_);
     state_ = LEGATO_STATE_ERROR;
     const std::int64_t now = engine_->scheduler_.now();
     emit_locked(LEGATO_EVENT_TYPE_ERROR, now, last_error_);
     emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"error\"}");
 }
 
-void Player::fill_startup_locked(bool reuse) {
-    cache_hit_ = 0;
-    decoder_reused_last_ = 0;
-    const bool short_video = std::strcmp(preset_->name, "short_video") == 0;
-    const bool realtime = std::strcmp(preset_->name, "realtime") == 0;
-    if (short_video && reuse) {
-        stage_probe_us_ = 0;
-        stage_first_packet_us_ = 50000;
-        stage_decoder_open_us_ = 0;
-        stage_decoded_us_ = 20000;
-        stage_presented_us_ = 10000;
-        cache_hit_ = 1;
-        decoder_reused_last_ = 1;
-    } else if (short_video) {
-        stage_probe_us_ = 20000;
-        stage_first_packet_us_ = 10000;
-        stage_decoder_open_us_ = 40000;
-        stage_decoded_us_ = 20000;
-        stage_presented_us_ = 10000;
-    } else if (realtime) {
-        stage_probe_us_ = 0;
-        stage_first_packet_us_ = 0;
-        stage_decoder_open_us_ = 10000;
-        stage_decoded_us_ = 5000;
-        stage_presented_us_ = 5000;
-    } else {
-        stage_probe_us_ = 40000;
-        stage_first_packet_us_ = 0;
-        stage_decoder_open_us_ = 50000;
-        stage_decoded_us_ = 20000;
-        stage_presented_us_ = 10000;
-    }
-    startup_us_ = stage_probe_us_ + stage_first_packet_us_ + stage_decoder_open_us_ + stage_decoded_us_ +
-                  stage_presented_us_;
-}
-
-namespace {
-
-/* 1 是本地路径，0 不是，-1 是路径放不进缓冲区。 */
-int local_path(const char* uri, char* out, std::size_t out_len) {
-    if (uri == nullptr || std::strncmp(uri, "corpus:", 7) == 0) {
-        return 0;
-    }
-    const char* path = uri;
-    if (std::strncmp(uri, "file://", 7) == 0) {
-        path = uri + 7;
-        if (std::strncmp(path, "localhost", 9) == 0) {
-            path += 9;
-        }
-    } else if (std::strstr(uri, "://") != nullptr) {
-        return 0;
-    }
-    if (path[0] == '\0') {
-        return 0;
-    }
-    const int wrote = std::snprintf(out, out_len, "%s", path);
-    if (wrote < 0 || static_cast<std::size_t>(wrote) >= out_len) {
-        return -1;
-    }
-    return 1;
-}
-
-}  /* namespace */
-
-bool Player::load_locked(const char* uri) {
+bool Player::begin_load_locked(const char* uri, std::uint64_t command_id) {
     leave_steady_state();
-    engine_->scheduler_.cancel(id_);
+    /* 同一次会话可以反复 load。trace_id 跟这一次打开走，不跟对象寿命走。 */
+    std::snprintf(trace_id_, sizeof(trace_id_), "p-%016llx",
+                  static_cast<unsigned long long>(g_player_ids.fetch_add(1, std::memory_order_relaxed)));
     ended_sent_ = false;
     first_frame_sent_ = false;
     file_mode_ = false;
+    ++generation_;
     if (uri == nullptr || uri[0] == '\0') {
         set_error_locked("invalid_argument", "uri 为空");
+        complete_command_locked(command_id, false);
         return true;
     }
-    /* corpus:// 走无头时钟，用来保住 T1 金标准。file:// 和普通路径走本地文件。
-       文件不存在也走文件这条路，由 open 报错，避免误当成合成媒体一直停在 loading。 */
     char path[4096];
-    const int kind = local_path(uri, path, sizeof(path));
-    if (kind < 0) {
-        set_error_locked("invalid_argument", "路径太长");
-        return true;
+    bool virtual_clock = false;
+    if (std::strncmp(uri, "corpus:", 7) == 0) {
+        const char* err_name = nullptr;
+        const char* err_message = nullptr;
+        if (resolve_corpus(LEGATO_SOURCE_DIR, uri, path, static_cast<int>(sizeof(path)), &err_name, &err_message) != 0) {
+            set_error_locked(err_name != nullptr ? err_name : "source_open_failed",
+                             err_message != nullptr ? err_message : "打不开这个文件");
+            complete_command_locked(command_id, false);
+            return true;
+        }
+        virtual_clock = true;
+    } else {
+        const int kind = local_file_path(uri, path, sizeof(path));
+        if (kind < 0) {
+            set_error_locked("invalid_argument", "路径太长");
+            complete_command_locked(command_id, false);
+            return true;
+        }
+        if (kind == 0) {
+            set_error_locked("unsupported_scheme", "这个协议还不能播");
+            complete_command_locked(command_id, false);
+            return true;
+        }
     }
-    if (kind > 0) {
-        return load_file_locked(path);
-    }
-    if (std::strncmp(uri, "corpus:", 7) != 0 && std::strstr(uri, "://") != nullptr) {
-        set_error_locked("unsupported", "这个协议还不能播");
-        return true;
-    }
-    pending_reuse_ = has_decoder_ && std::strcmp(preset_->name, "short_video") == 0;
-    fill_startup_locked(pending_reuse_);
+    virtual_session_ = virtual_clock;
+    segment_set_ = false;
+    io_busy_ = true;
     state_ = LEGATO_STATE_LOADING;
     load_us_ = engine_->scheduler_.now();
-    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, load_us_, "{\"state\":\"loading\"}");
-    const std::int64_t when = load_us_ + startup_us_;
-    engine_->scheduler_.schedule(id_, when, [this](std::int64_t fired) { on_first_frame(fired); });
-    return true;
-}
-
-bool Player::load_file_locked(const char* path) {
-    file_mode_ = true;
     file_load_mono_ = monotonic_us();
-    playback_ = std::make_unique<FilePlayback>(this);
-    if (playback_->open(path) != 0) {
-        playback_.reset();
-        file_mode_ = false;
-        set_error_locked("invalid_argument", "打不开这个文件");
-        return true;
+    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, load_us_, "{\"state\":\"loading\"}");
+    {
+        std::lock_guard<std::mutex> io_lock(io_mu_);
+        std::snprintf(io_job_.path, sizeof(io_job_.path), "%s", path);
+        io_job_.generation = generation_;
+        io_job_.command_id = command_id;
+        io_job_.virtual_clock = virtual_clock;
+        io_job_.decode_video = preset_ != nullptr && preset_->video;
+        io_job_.buffer_start_s = preset_ != nullptr ? preset_->buffer_start_s : 1.5;
+        io_job_.buffer_resume_s = preset_ != nullptr ? preset_->buffer_resume_s : 3;
+        io_job_.buffer_max_s = preset_ != nullptr ? preset_->buffer_max_s : 50;
+        io_job_.pending = true;
     }
-    const std::int64_t duration = playback_->duration_us();
-    if (duration > 0) {
-        duration_us_ = duration;
-    }
-    state_ = LEGATO_STATE_LOADING;
-    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, 0, "{\"state\":\"loading\"}");
-    if (playing_intent_) {
-        playback_->start();
-    }
+    io_cv_.notify_all();
     return true;
 }
 
-void Player::stop_file() {
-    if (playback_) {
-        playback_->stop_and_join();
+/* IO 线程只打开文件。这里不持有 Engine::mu_ 或 Player::mu_，打开可以阻塞。 */
+void Player::io_main() {
+    while (!io_stop_.load()) {
+        OpenJob job;
+        {
+            std::unique_lock<std::mutex> lock(io_mu_);
+            io_cv_.wait(lock, [this] { return io_stop_.load() || io_job_.pending; });
+            if (io_stop_.load()) {
+                return;
+            }
+            job = io_job_;
+            io_job_.pending = false;
+        }
+        Clock* clock = job.virtual_clock ? &engine_->virtual_clock() : nullptr;
+        auto playback = std::make_unique<FilePlayback>(this, clock, job.virtual_clock, job.decode_video,
+                                                       job.buffer_start_s, job.buffer_resume_s, job.buffer_max_s);
+        const int rc = playback->open(job.path);
+        auto held = std::make_shared<std::unique_ptr<FilePlayback>>(std::move(playback));
+        engine_->post([this, job, held, rc] { finish_open_job(job, std::move(*held), rc); });
     }
+}
+
+void Player::finish_open(std::uint64_t generation, std::uint64_t command_id, bool ok) {
+    (void)generation;
+    (void)command_id;
+    (void)ok;
+}
+
+void Player::finish_open_job(const OpenJob& job, std::unique_ptr<FilePlayback> playback, int rc) {
+    std::unique_ptr<FilePlayback> drop;
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        io_busy_ = false;
+        if (released_ || job.generation != generation_) {
+            drop = std::move(playback);
+            complete_command_locked(job.command_id, false);
+            wake = true;
+        } else if (rc != 0) {
+            const char* name = playback != nullptr ? playback->error_name() : "source_open_failed";
+            const char* message = playback != nullptr ? playback->error_message() : "打不开这个文件";
+            set_error_locked(name != nullptr ? name : "source_open_failed",
+                             message != nullptr ? message : "打不开这个文件");
+            drop = std::move(playback);
+            complete_command_locked(job.command_id, false);
+            wake = true;
+        } else {
+            playback_ = std::move(playback);
+            file_mode_ = true;
+            const FilePlayback::Stages stages = playback_->stages();
+            stage_probe_us_ = stages.probe_us;
+            stage_first_packet_us_ = stages.first_packet_us;
+            stage_decoder_open_us_ = stages.decoder_open_us;
+            stage_decoded_us_ = stages.decoded_us;
+            if (playback_->duration_us() > 0) {
+                duration_us_ = playback_->duration_us();
+            }
+            if (job.virtual_clock) {
+                std::snprintf(output_path_, sizeof(output_path_), "record");
+            }
+            if (!segment_set_) {
+                play_virtual_us_ = engine_->virtual_clock().now_us();
+                segment_virtual_us_ = play_virtual_us_;
+                segment_media_us_ = media_start_us_;
+                segment_set_ = true;
+            }
+            /* load 之前的 Seek 只写过 media_start。打开完成后补一次，解码从目标位置开始。 */
+            if (media_start_us_ > 0) {
+                playback_->seek(media_start_us_, static_cast<std::uint32_t>(serial_));
+            }
+            if (playing_intent_) {
+                playback_->start();
+            }
+            complete_command_locked(job.command_id, true);
+            wake = true;
+        }
+    }
+    drop.reset();
+    dispatch(wake);
 }
 
 void Player::set_media_position(std::int64_t position_us) {
@@ -298,42 +412,50 @@ void Player::media_failed(const char* message) {
         if (!file_mode_) {
             return;
         }
-        set_error_locked("invalid_argument", message != nullptr ? message : "播放失败");
+        const char* text = message != nullptr ? message : "播放失败";
+        const char* name = "decode_failed";
+        if (std::strcmp(text, "定位失败") == 0) {
+            name = "seek_failed";
+        } else if (std::strcmp(text, "读包失败") == 0) {
+            name = "demux_failed";
+        } else if (std::strcmp(text, "声卡写入失败") == 0) {
+            name = "audio_device_unavailable";
+        }
+        set_error_locked(name, text);
         wake = true;
     }
     dispatch(wake);
 }
 
-void Player::on_first_frame(std::int64_t when_us) {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (released_ || state_ != LEGATO_STATE_LOADING) {
-        return;
+void Player::note_stall() {
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!file_mode_ || released_) {
+            return;
+        }
+        ++stall_count_;
+        if (state_ == LEGATO_STATE_PLAYING && playing_intent_) {
+            state_ = LEGATO_STATE_BUFFERING;
+            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, monotonic_us(), "{\"state\":\"buffering\"}");
+            wake = true;
+        }
     }
-    last_first_frame_us_ = when_us - load_us_;
-    if (pending_reuse_) {
-        ++decoder_reused_;
-    }
-    ++presented_;
-    has_decoder_ = true;
-    if (playing_intent_) {
-        origin_us_ = when_us;
+    dispatch(wake);
+}
+
+void Player::note_buffer_resumed() {
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!file_mode_ || released_ || !playing_intent_ || state_ != LEGATO_STATE_BUFFERING) {
+            return;
+        }
         state_ = LEGATO_STATE_PLAYING;
-        position_us_.store(media_start_us_, std::memory_order_release);
-    } else {
-        state_ = LEGATO_STATE_READY;
-        position_us_.store(media_start_us_, std::memory_order_release);
+        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, monotonic_us(), "{\"state\":\"playing\"}");
+        wake = true;
     }
-    enter_steady_state();
-    null_audio_present(media_start_us_);
-    if (preset_->video) {
-        null_video_present(media_start_us_);
-    }
-    char frame_json[96];
-    std::snprintf(frame_json, sizeof(frame_json), "{\"us\":%lld}", static_cast<long long>(last_first_frame_us_));
-    emit_locked(LEGATO_EVENT_TYPE_FIRST_FRAME, when_us, frame_json);
-    char state_json[64];
-    std::snprintf(state_json, sizeof(state_json), "{\"state\":\"%s\"}", legato_state_name(state_));
-    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, when_us, state_json);
+    dispatch(wake);
 }
 
 void Player::update_position_locked() {
@@ -358,26 +480,28 @@ void Player::update_position_locked() {
 
 bool Player::play_locked() {
     playing_intent_ = true;
-    if (file_mode_ && playback_) {
-        if (state_ == LEGATO_STATE_ENDED) {
-            ended_sent_ = false;
-            first_frame_sent_ = false;
-            state_ = LEGATO_STATE_LOADING;
-        }
-        playback_->start();
-        return false;
-    }
     if (state_ == LEGATO_STATE_ENDED) {
         media_start_us_ = 0;
         position_us_.store(0, std::memory_order_release);
         ended_sent_ = false;
+        first_frame_sent_ = false;
+        segment_media_us_ = 0;
+        segment_virtual_us_ = engine_->virtual_clock().now_us();
+        segment_set_ = true;
     }
-    if (state_ == LEGATO_STATE_READY || state_ == LEGATO_STATE_ENDED) {
-        origin_us_ = engine_->scheduler_.now();
-        state_ = LEGATO_STATE_PLAYING;
-        char state_json[64];
-        std::snprintf(state_json, sizeof(state_json), "{\"state\":\"playing\"}");
-        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, origin_us_, state_json);
+    if (playback_) {
+        if (!segment_set_) {
+            play_virtual_us_ = engine_->virtual_clock().now_us();
+            segment_virtual_us_ = play_virtual_us_;
+            segment_media_us_ = media_start_us_;
+            segment_set_ = true;
+        }
+        playback_->start();
+        if (state_ == LEGATO_STATE_READY) {
+            state_ = LEGATO_STATE_PLAYING;
+            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, engine_->scheduler_.now(), "{\"state\":\"playing\"}");
+            return true;
+        }
         return true;
     }
     return false;
@@ -404,6 +528,7 @@ bool Player::pause_locked() {
 }
 
 bool Player::seek_locked(std::int64_t position_us, int mode) {
+    note_test_seek_mode(mode);
     if (position_us < 0) {
         position_us = 0;
     }
@@ -418,7 +543,10 @@ bool Player::seek_locked(std::int64_t position_us, int mode) {
         if (state_ == LEGATO_STATE_ENDED) {
             state_ = LEGATO_STATE_READY;
         }
-        playback_->request_seek(position_us);
+        playback_->seek(position_us, static_cast<std::uint32_t>(serial_));
+        segment_media_us_ = position_us;
+        segment_virtual_us_ = engine_->virtual_clock().now_us();
+        segment_set_ = true;
         char json[96];
         const char* mode_name = "precise";
         if (mode == LEGATO_SEEK_MODE_KEYFRAME) {
@@ -446,17 +574,6 @@ bool Player::seek_locked(std::int64_t position_us, int mode) {
     char json[96];
     std::snprintf(json, sizeof(json), "{\"position_us\":%lld,\"mode\":\"%s\"}",
                   static_cast<long long>(position_us), mode_name);
-    const bool coalescable = state_ == LEGATO_STATE_IDLE || state_ == LEGATO_STATE_LOADING;
-    if (coalescable && ev_write_ != ev_read_) {
-        const std::uint32_t last = (ev_write_ + 31) % 32;
-        EventSlot& slot = events_[last];
-        if (slot.live && slot.type == LEGATO_EVENT_TYPE_SEEK) {
-            slot.time_us = engine_->scheduler_.now();
-            copy_json_string(slot.json, sizeof(slot.json), json);
-            wake_ = true;
-            return true;
-        }
-    }
     emit_locked(LEGATO_EVENT_TYPE_SEEK, engine_->scheduler_.now(), json);
     return true;
 }
@@ -478,102 +595,151 @@ bool Player::stop_locked() {
 }
 
 int Player::load_uri(const char* uri, std::uint64_t* command_id) {
-    stop_file();
-    bool wake = false;
-    engine_->post_control([&] {
-        std::lock_guard<std::mutex> engine_lock(engine_->mu_);
-        std::lock_guard<std::mutex> self_lock(mu_);
-        playback_.reset();
-        file_mode_ = false;
-        bump_locked(command_id);
-        if (ignore_if_released_locked()) {
-            return;
+    const std::string copy = uri != nullptr ? uri : "";
+    std::uint64_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        id = bump_locked(command_id);
+    }
+    engine_->post([this, copy, id] {
+        std::unique_ptr<FilePlayback> old;
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> self_lock(mu_);
+            if (ignore_if_released_locked()) {
+                complete_command_locked(id, false);
+                wake = true;
+            } else {
+                old = std::move(playback_);
+                file_mode_ = false;
+                wake = begin_load_locked(copy.c_str(), id);
+            }
         }
-        wake = load_locked(uri);
+        old.reset();
+        dispatch(wake);
     });
-    dispatch(wake);
     return LEGATO_ERR_OK;
 }
 
 int Player::play(std::uint64_t* command_id) {
-    bool wake = false;
-    engine_->post_control([&] {
-        std::lock_guard<std::mutex> engine_lock(engine_->mu_);
-        std::lock_guard<std::mutex> self_lock(mu_);
-        bump_locked(command_id);
-        if (ignore_if_released_locked()) {
-            return;
+    std::uint64_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        id = bump_locked(command_id);
+    }
+    engine_->post([this, id] {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> self_lock(mu_);
+            if (ignore_if_released_locked()) {
+                complete_command_locked(id, false);
+            } else {
+                play_locked();
+                complete_command_locked(id, true);
+            }
+            wake = wake_;
         }
-        wake = play_locked();
+        dispatch(wake);
     });
-    dispatch(wake);
     return LEGATO_ERR_OK;
 }
 
 int Player::pause(std::uint64_t* command_id) {
-    bool wake = false;
-    engine_->post_control([&] {
-        std::lock_guard<std::mutex> engine_lock(engine_->mu_);
-        std::lock_guard<std::mutex> self_lock(mu_);
-        bump_locked(command_id);
-        if (ignore_if_released_locked()) {
-            return;
+    std::uint64_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        id = bump_locked(command_id);
+    }
+    engine_->post([this, id] {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> self_lock(mu_);
+            if (ignore_if_released_locked()) {
+                complete_command_locked(id, false);
+            } else {
+                pause_locked();
+                complete_command_locked(id, true);
+            }
+            wake = wake_;
         }
-        wake = pause_locked();
+        dispatch(wake);
     });
-    dispatch(wake);
     return LEGATO_ERR_OK;
 }
 
 int Player::seek(std::int64_t position_us, int mode, std::uint64_t* command_id) {
-    bool wake = false;
-    engine_->post_control([&] {
-        std::lock_guard<std::mutex> engine_lock(engine_->mu_);
-        std::lock_guard<std::mutex> self_lock(mu_);
-        bump_locked(command_id);
-        if (ignore_if_released_locked()) {
-            return;
+    std::uint64_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        id = bump_locked(command_id);
+    }
+    engine_->post([this, position_us, mode, id] {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> self_lock(mu_);
+            if (ignore_if_released_locked()) {
+                complete_command_locked(id, false);
+            } else {
+                seek_locked(position_us, mode);
+                complete_command_locked(id, true);
+            }
+            wake = wake_;
         }
-        wake = seek_locked(position_us, mode);
+        dispatch(wake);
     });
-    dispatch(wake);
     return LEGATO_ERR_OK;
 }
 
 int Player::stop(std::uint64_t* command_id) {
-    bool wake = false;
-    engine_->post_control([&] {
-        std::lock_guard<std::mutex> engine_lock(engine_->mu_);
-        std::lock_guard<std::mutex> self_lock(mu_);
-        bump_locked(command_id);
-        if (ignore_if_released_locked()) {
-            return;
+    std::uint64_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        id = bump_locked(command_id);
+    }
+    engine_->post([this, id] {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> self_lock(mu_);
+            if (ignore_if_released_locked()) {
+                complete_command_locked(id, false);
+            } else {
+                stop_locked();
+                complete_command_locked(id, true);
+            }
+            wake = wake_;
         }
-        wake = stop_locked();
+        dispatch(wake);
     });
-    dispatch(wake);
     return LEGATO_ERR_OK;
 }
 
 int Player::set_preset_name(const char* name, std::uint64_t* command_id) {
-    bool wake = false;
+    const std::string copy = name != nullptr ? name : "";
+    std::uint64_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        id = bump_locked(command_id);
+    }
     int rc = LEGATO_ERR_OK;
-    engine_->post_control([&] {
-        std::lock_guard<std::mutex> engine_lock(engine_->mu_);
+    bool wake = false;
+    {
         std::lock_guard<std::mutex> self_lock(mu_);
-        bump_locked(command_id);
         if (ignore_if_released_locked()) {
-            return;
-        }
-        const PresetDesc* found = find_preset(name);
-        if (found == nullptr) {
-            set_error_locked("invalid_argument", "未知预设");
+            complete_command_locked(id, false);
             wake = true;
-            rc = LEGATO_ERR_INVALID_ARGUMENT;
         } else {
-            preset_ = found;
+            const PresetDesc* found = find_preset(copy.c_str());
+            if (found == nullptr) {
+                set_error_locked("invalid_argument", "未知预设");
+                complete_command_locked(id, false);
+                rc = LEGATO_ERR_INVALID_ARGUMENT;
+            } else {
+                preset_ = found;
+                complete_command_locked(id, true);
+            }
+            wake = wake_;
         }
-    });
+    }
     dispatch(wake);
     return rc;
 }
@@ -692,7 +858,73 @@ int Player::read_stats(legato_session_stats* out) {
     out->stage_presented_us = stage_presented_us_;
     out->cache_hit = cache_hit_;
     out->decoder_reused_last = decoder_reused_last_;
+    out->events_dropped = events_dropped_;
+    std::snprintf(out->presentation_sha256, sizeof(out->presentation_sha256), "%s", presentation_sha256_);
     return LEGATO_ERR_OK;
+}
+
+int Player::default_seek_mode() const {
+    if (preset_ != nullptr && preset_->exact_seek) {
+        return LEGATO_SEEK_MODE_PRECISE;
+    }
+    return LEGATO_SEEK_MODE_KEYFRAME;
+}
+
+void Player::prepare_advance(std::int64_t delta_us) {
+    FilePlayback* playback = nullptr;
+    std::int64_t target = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (released_ || !virtual_session_ || playback_ == nullptr || !playing_intent_) {
+            return;
+        }
+        playback = playback_.get();
+        const std::int64_t now = engine_->virtual_clock().now_us();
+        target = segment_media_us_ + (now + delta_us - segment_virtual_us_);
+    }
+    if (playback != nullptr) {
+        playback->wait_decoded(target);
+    }
+}
+
+void Player::poll_observe() {
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (released_) {
+            return;
+        }
+        const std::int64_t now = monotonic_us();
+        for (std::size_t i = 0; i < 8; ++i) {
+            Watch& watch = watches_[i];
+            if (!watch.used) {
+                continue;
+            }
+            char text[128];
+            if (std::strcmp(watch.name, LEGATO_PROP_STATE) == 0) {
+                std::snprintf(text, sizeof(text), "%s", legato_state_name(state_));
+            } else if (std::strcmp(watch.name, LEGATO_PROP_POSITION_US) == 0) {
+                std::snprintf(text, sizeof(text), "%lld", static_cast<long long>(position_us_.load()));
+            } else {
+                std::snprintf(text, sizeof(text), "%s", watch.name);
+            }
+            const std::int64_t interval = static_cast<std::int64_t>(watch.min_interval_s * 1000000.0);
+            if (std::strcmp(text, watch_text_[i]) == 0) {
+                continue;
+            }
+            if (watch_at_us_[i] != 0 && now - watch_at_us_[i] < interval) {
+                continue;
+            }
+            std::snprintf(watch_text_[i], sizeof(watch_text_[i]), "%s", text);
+            watch_at_us_[i] = now;
+            char json[256];
+            std::snprintf(json, sizeof(json), "{\"property\":\"%s\",\"tag\":%llu,\"value\":\"%s\"}", watch.name,
+                          static_cast<unsigned long long>(watch.tag), text);
+            emit_locked(LEGATO_EVENT_TYPE_PROPERTY_CHANGED, now, json);
+            wake = true;
+        }
+    }
+    dispatch(wake);
 }
 
 const legato_event* Player::next_event() {
@@ -730,11 +962,71 @@ int Player::attach_surface(void* handle) {
 }
 
 void Player::on_clock_advanced() {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (released_ || file_mode_) {
-        return;
+    FilePlayback* playback = nullptr;
+    std::int64_t elapsed = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (released_) {
+            return;
+        }
+        if (!virtual_session_ || playback_ == nullptr) {
+            update_position_locked();
+            return;
+        }
+        playback = playback_.get();
+        elapsed = engine_->virtual_clock().now_us() - segment_virtual_us_;
+        if (elapsed < 0) {
+            elapsed = 0;
+        }
     }
-    update_position_locked();
+    FilePlayback::PresentUpdate update;
+    playback->present_until(elapsed, &update);
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (released_ || playback_.get() != playback) {
+            return;
+        }
+        const std::int64_t now = engine_->virtual_clock().now_us();
+        if (update.sha256[0] != '\0') {
+            std::snprintf(presentation_sha256_, sizeof(presentation_sha256_), "%s", update.sha256);
+        }
+        if (update.presented > presented_) {
+            presented_ = update.presented;
+        }
+        av_sync_us_ = update.av_sync_us;
+        if (update.first && !first_frame_sent_) {
+            first_frame_sent_ = true;
+            last_first_frame_us_ = update.first_frame_us;
+            stage_presented_us_ = update.first_frame_us;
+            startup_us_ = update.first_frame_us;
+            has_decoder_ = true;
+            enter_steady_state();
+            char frame_json[96];
+            std::snprintf(frame_json, sizeof(frame_json), "{\"us\":%lld}", static_cast<long long>(last_first_frame_us_));
+            emit_locked(LEGATO_EVENT_TYPE_FIRST_FRAME, now, frame_json);
+            if (playing_intent_) {
+                state_ = LEGATO_STATE_PLAYING;
+                emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"playing\"}");
+            } else {
+                state_ = LEGATO_STATE_READY;
+                emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"ready\"}");
+            }
+        }
+        std::int64_t pos = segment_media_us_ + elapsed;
+        if (duration_us_ > 0 && pos >= duration_us_) {
+            pos = duration_us_;
+            if (!ended_sent_ && update.ended) {
+                ended_sent_ = true;
+                state_ = LEGATO_STATE_ENDED;
+                emit_locked(LEGATO_EVENT_TYPE_ENDED, now, "{\"reason\":\"eos\"}");
+                emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"ended\"}");
+            }
+        }
+        position_us_.store(pos, std::memory_order_release);
+        wake = wake_;
+    }
+    dispatch(wake);
 }
 
 bool Player::take_wake() {

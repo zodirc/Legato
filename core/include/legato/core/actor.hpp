@@ -11,8 +11,7 @@
 namespace legato {
 
 /* Serial executor. Inline mode runs the task inside post(). Threaded mode
-   owns one thread. The engine control actor is threaded; callers wait until
-   the posted turn finishes, so headless tests stay ordered. */
+   owns one thread and returns after the task is queued. */
 class Actor {
 public:
     explicit Actor(bool threaded);

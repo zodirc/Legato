@@ -91,6 +91,8 @@ typedef struct legato_session_stats {
     int64_t stage_presented_us;
     int32_t cache_hit;
     int32_t decoder_reused_last;
+    int32_t events_dropped;
+    char presentation_sha256[65];
 } legato_session_stats;
 
 LEGATO_API uint32_t legato_abi_version(void);
@@ -132,6 +134,19 @@ LEGATO_API uint64_t legato_player_tap(legato_player* player, const char* tap_spe
                                       void (*on_data)(const legato_buffer*, void*), void* userdata);
 
 LEGATO_API void legato_free(void* ptr);
+
+/* 测试钩子。打开文件前睡眠 delay_us，用来证明 load 和 release 不在调用线程上等待。 */
+LEGATO_API void legato_test_set_open_delay_us(int64_t delay_us);
+LEGATO_API int legato_test_last_seek_mode(void);
+LEGATO_API int legato_test_video_decoder_opens(void);
+LEGATO_API void legato_test_reset_video_decoder_opens(void);
+LEGATO_API void legato_test_set_pcm_output(int enable);
+LEGATO_API void legato_test_kick_decode_delay_us(int64_t delay_us);
+LEGATO_API int legato_test_decode_delay_started(void);
+LEGATO_API int legato_test_decode_delay_applied(void);
+LEGATO_API int legato_test_pcm_pops(void);
+LEGATO_API int legato_test_pcm_xruns(void);
+LEGATO_API void legato_test_set_hold_demux(int hold);
 
 #ifdef __cplusplus
 }

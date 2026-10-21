@@ -6,18 +6,25 @@
 #include "legato/legato.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace legato {
 
 class FilePlayback;
 
-class Player {
+class Player : public std::enable_shared_from_this<Player> {
 public:
     Player(std::shared_ptr<Engine> engine, const PresetDesc* preset);
     ~Player();
+    void register_self(const std::shared_ptr<Player>& self);
+    void request_release();
+    void prepare_advance(std::int64_t delta_us);
+    void poll_observe();
+    int default_seek_mode() const;
 
     Player(const Player&) = delete;
     Player& operator=(const Player&) = delete;
@@ -47,6 +54,8 @@ public:
     void media_first_frame(std::int64_t position_us, std::int64_t startup_us);
     void media_ended();
     void media_failed(const char* message);
+    void note_stall();
+    void note_buffer_resumed();
     std::int64_t file_load_mono() const { return file_load_mono_; }
 
 private:
@@ -64,21 +73,35 @@ private:
         std::uint64_t tag = 0;
     };
 
-    bool load_locked(const char* uri);
-    bool load_file_locked(const char* path);
-    void stop_file();
+    struct OpenJob {
+        bool pending = false;
+        char path[4096]{};
+        std::uint64_t generation = 0;
+        std::uint64_t command_id = 0;
+        bool virtual_clock = false;
+        bool decode_video = true;
+        double buffer_start_s = 1.5;
+        double buffer_resume_s = 3;
+        double buffer_max_s = 50;
+    };
+
+    bool begin_load_locked(const char* uri, std::uint64_t command_id);
+    void io_main();
+    void finish_open(std::uint64_t generation, std::uint64_t command_id, bool ok);
+    void finish_open_job(const OpenJob& job, std::unique_ptr<FilePlayback> playback, int rc);
     bool play_locked();
     bool pause_locked();
     bool seek_locked(std::int64_t position_us, int mode);
     bool stop_locked();
-    void on_first_frame(std::int64_t when_us);
     void update_position_locked();
     void emit_locked(int type, std::int64_t time_us, const char* json);
+    bool same_merge(const EventSlot& slot, int type, const char* json) const;
+    void complete_command_locked(std::uint64_t command_id, bool ok);
     void set_error_locked(const char* name, const char* message);
-    void fill_startup_locked(bool reuse);
     void dispatch(bool wake);
     std::uint64_t bump_locked(std::uint64_t* command_id);
     bool ignore_if_released_locked();
+    bool protected_event(int type) const;
 
     std::shared_ptr<Engine> engine_;
     std::mutex mu_;
@@ -88,12 +111,27 @@ private:
     bool warned_released_ = false;
     bool playing_intent_ = false;
     bool has_decoder_ = false;
-    bool pending_reuse_ = false;
     bool ended_sent_ = false;
     bool first_frame_sent_ = false;
     bool file_mode_ = false;
     std::int64_t file_load_mono_ = 0;
     std::unique_ptr<FilePlayback> playback_;
+    std::thread io_;
+    std::mutex io_mu_;
+    std::condition_variable io_cv_;
+    OpenJob io_job_;
+    std::atomic<bool> io_stop_{false};
+    bool io_busy_ = false;
+    std::uint64_t generation_ = 0;
+    bool virtual_session_ = false;
+    bool segment_set_ = false;
+    std::int64_t play_virtual_us_ = 0;
+    std::int64_t segment_virtual_us_ = 0;
+    std::int64_t segment_media_us_ = 0;
+    char trace_id_[24] = "p-0";
+    char presentation_sha256_[65]{};
+    char watch_text_[8][128]{};
+    std::int64_t watch_at_us_[8]{};
     int state_ = LEGATO_STATE_IDLE;
     int serial_ = 1;
     std::int64_t media_start_us_ = 0;
@@ -111,6 +149,7 @@ private:
     int presented_ = 0;
     int decoder_reused_ = 0;
     int stall_count_ = 0;
+    int events_dropped_ = 0;
     std::int64_t last_first_frame_us_ = -1;
     std::int64_t av_sync_us_ = 0;
     char output_path_[16] = "none";

@@ -1,6 +1,7 @@
 #include "legato/render/alsa_sink.hpp"
 
 #include "legato/core/log.hpp"
+#include "legato/engine/test_hooks.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -116,6 +117,8 @@ int AlsaSink::write_frames(const std::int16_t* interleaved, int frames) {
             if (interrupted_.load()) {
                 return 0;
             }
+            /* 暂停造成的打断已经在上面返回。这里是设备欠载。 */
+            note_pcm_xrun();
             if (snd_pcm_recover(pcm, static_cast<int>(wrote), 1) < 0) {
                 return -1;
             }

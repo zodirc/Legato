@@ -76,6 +76,10 @@ add_library(legato SHARED
   engine/src/engine.cpp
   engine/src/player.cpp
   engine/src/file_playback.cpp
+  engine/src/media_queue.cpp
+  engine/src/clock.cpp
+  engine/src/corpus.cpp
+  engine/src/test_hooks.cpp
   io/src/file_source.cpp
   render/src/null_sink.cpp
   api/src/abi.cpp
@@ -107,7 +111,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   endif()
 endif()
 target_include_directories(legato PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(legato PRIVATE LEGATO_BUILDING)
+target_include_directories(legato PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/src)
+target_compile_definitions(legato PRIVATE LEGATO_BUILDING LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 if(MSVC)
   target_compile_options(legato PRIVATE /W4)
 else()

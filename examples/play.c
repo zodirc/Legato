@@ -48,16 +48,32 @@ int main(int argc, char** argv) {
     memset(&item, 0, sizeof(item));
     item.struct_size = (uint32_t)sizeof(item);
     item.uri = argv[1];
-    /* load 返回 0 只表示命令被接受。打不开文件时状态是 "error"，原因在 last_error。 */
-    if (legato_player_load(player, &item) != 0 || state_is(player, "\"error\"")) {
+    /* load 返回 0 只表示命令被接受。打开在会话的 IO 线程上完成。 */
+    if (legato_player_load(player, &item) != 0 || legato_player_play(player) != 0) {
         fprintf(stderr, "打开失败: %s\n", argv[1]);
         print_last_error(player);
         legato_player_release(player);
         legato_engine_destroy(engine);
         return 1;
     }
-    if (legato_player_play(player) != 0) {
-        fprintf(stderr, "起播失败: %s\n", argv[1]);
+    int opened = 0;
+    for (int spin = 0; spin < 500; ++spin) {
+        if (state_is(player, "\"error\"")) {
+            fprintf(stderr, "打开失败: %s\n", argv[1]);
+            print_last_error(player);
+            legato_player_release(player);
+            legato_engine_destroy(engine);
+            return 1;
+        }
+        if (state_is(player, "\"playing\"") || state_is(player, "\"ready\"") || state_is(player, "\"ended\"")) {
+            opened = 1;
+            break;
+        }
+        const struct timespec pause = {0, 20000000};
+        nanosleep(&pause, NULL);
+    }
+    if (!opened) {
+        fprintf(stderr, "打开超时: %s\n", argv[1]);
         print_last_error(player);
         legato_player_release(player);
         legato_engine_destroy(engine);

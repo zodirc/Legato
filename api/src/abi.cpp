@@ -5,6 +5,7 @@
 #include "legato/engine/engine.hpp"
 #include "legato/engine/player.hpp"
 #include "legato/engine/preset.hpp"
+#include "legato/engine/test_hooks.hpp"
 
 #include <cstddef>
 #include <cstdlib>
@@ -71,7 +72,14 @@ legato_engine* legato_engine_create(const char* config_json) {
     return reinterpret_cast<legato_engine*>(shell);
 }
 
-void legato_engine_destroy(legato_engine* engine) { delete engine_shell(engine); }
+void legato_engine_destroy(legato_engine* engine) {
+    EngineShell* shell = engine_shell(engine);
+    if (shell != nullptr && shell->engine) {
+        /* 在调用线程上停掉控制和回收线程，避免回收线程析构 Engine 时 join 自己。 */
+        shell->engine->shutdown();
+    }
+    delete shell;
+}
 
 void legato_warmup(legato_engine* engine) {
     std::shared_ptr<legato::Engine> held;
@@ -118,6 +126,7 @@ legato_player* legato_player_create(legato_engine* engine, const char* options_j
         return nullptr;
     }
     shell->player = std::make_shared<legato::Player>(held, preset);
+    shell->player->register_self(shell->player);
     return reinterpret_cast<legato_player*>(shell);
 }
 
@@ -131,7 +140,9 @@ void legato_player_release(legato_player* player) {
         std::lock_guard<std::mutex> lock(shell->mu);
         dropped = std::move(shell->player);
     }
-    dropped.reset();
+    if (dropped) {
+        dropped->request_release();
+    }
 }
 
 uint64_t legato_player_command(legato_player* player, const char* command_json) {
@@ -168,7 +179,7 @@ uint64_t legato_player_command(legato_player* player, const char* command_json) 
         if (!legato::json_copy_i64(command_json, "position_us", &position)) {
             return 0;
         }
-        int mode = LEGATO_SEEK_MODE_PRECISE;
+        int mode = held->default_seek_mode();
         char mode_name[32];
         if (legato::json_copy_string(command_json, "mode", mode_name, sizeof(mode_name))) {
             if (std::strcmp(mode_name, "keyframe") == 0) {
@@ -342,5 +353,27 @@ uint64_t legato_player_tap(legato_player* /*player*/, const char* /*tap_spec_jso
 }
 
 void legato_free(void* ptr) { std::free(ptr); }
+
+void legato_test_set_open_delay_us(int64_t delay_us) { legato::set_test_open_delay_us(delay_us); }
+
+int legato_test_last_seek_mode(void) { return legato::test_last_seek_mode(); }
+
+int legato_test_video_decoder_opens(void) { return legato::test_video_decoder_opens(); }
+
+void legato_test_reset_video_decoder_opens(void) { legato::reset_test_video_decoder_opens(); }
+
+void legato_test_set_pcm_output(int enable) { legato::set_test_pcm_output(enable); }
+
+void legato_test_kick_decode_delay_us(int64_t delay_us) { legato::kick_test_decode_delay_us(delay_us); }
+
+int legato_test_decode_delay_started(void) { return legato::test_decode_delay_started(); }
+
+int legato_test_decode_delay_applied(void) { return legato::test_decode_delay_applied(); }
+
+int legato_test_pcm_pops(void) { return legato::test_pcm_pops(); }
+
+int legato_test_pcm_xruns(void) { return legato::test_pcm_xruns(); }
+
+void legato_test_set_hold_demux(int hold) { legato::set_test_hold_demux(hold); }
 
 }  /* extern "C" */
