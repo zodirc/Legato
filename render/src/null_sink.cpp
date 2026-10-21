@@ -1,6 +1,13 @@
 #include "legato/render/sink.hpp"
 
+#include "legato/engine/test_hooks.hpp"
+#include "sha256.hpp"
+
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <thread>
 
 namespace legato {
 namespace {
@@ -20,5 +27,86 @@ void null_video_present(std::int64_t /*pts_us*/) {
 
 std::uint64_t null_audio_frames() { return g_audio_frames.load(std::memory_order_relaxed); }
 std::uint64_t null_video_frames() { return g_video_frames.load(std::memory_order_relaxed); }
+
+void NullAudioSink::bind_cancel(const std::atomic<bool>* cancel) { cancel_ = cancel; }
+
+/* 验收把这次打开拉长。阻塞留在 Sink 上，调用线程上的 load 和 release 仍然立即返回。
+   取消后返回失败，避免回收已经开始后还继续建解码器。 */
+int NullAudioSink::open(int sample_rate, int /*channels*/) {
+    rate_ = sample_rate > 0 ? sample_rate : 48000;
+    consumed_ = 0;
+    std::int64_t left = test_open_delay_us();
+    while (left > 0) {
+        if (cancel_ != nullptr && cancel_->load()) {
+            return -1;
+        }
+        const std::int64_t slice = left > 20000 ? 20000 : left;
+        std::this_thread::sleep_for(std::chrono::microseconds(slice));
+        left -= slice;
+    }
+    if (cancel_ != nullptr && cancel_->load()) {
+        return -1;
+    }
+    return 0;
+}
+
+void NullAudioSink::present(std::int64_t /*pts_us*/) {}
+
+void NullAudioSink::close() {}
+
+void NullAudioSink::reset() { consumed_ = 0; }
+
+std::int64_t NullAudioSink::consume(int samples) {
+    if (samples > 0) {
+        consumed_ += samples;
+    }
+    if (rate_ <= 0) {
+        return 0;
+    }
+    return clock_us();
+}
+
+std::int64_t NullAudioSink::clock_us() const {
+    if (rate_ <= 0) {
+        return 0;
+    }
+    return consumed_ * 1000000 / rate_;
+}
+
+struct RecordingVideoSink::State {
+    bench::Sha256 hash;
+};
+
+RecordingVideoSink::RecordingVideoSink() : state_(std::make_unique<State>()) {}
+
+RecordingVideoSink::~RecordingVideoSink() = default;
+
+void RecordingVideoSink::present(std::int64_t pts_us) { record(pts_us, 0, 0, 0); }
+
+void RecordingVideoSink::record(std::int64_t pts_us, std::uint64_t content, std::int64_t origin_us,
+                                std::int64_t audio_clock_us) {
+    unsigned char bytes[16];
+    const std::uint64_t pts = static_cast<std::uint64_t>(pts_us);
+    for (int i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<unsigned char>((pts >> (i * 8)) & 0xffu);
+        bytes[8 + i] = static_cast<unsigned char>((content >> (i * 8)) & 0xffu);
+    }
+    state_->hash.update(bytes, sizeof(bytes));
+    started_ = true;
+    ++presented_;
+    const std::int64_t sync = pts_us - (origin_us + audio_clock_us);
+    if (sync > worst_sync_us_ || -sync > worst_sync_us_) {
+        worst_sync_us_ = sync;
+    }
+}
+
+bool RecordingVideoSink::copy_hash(char* out, std::size_t out_len) const {
+    if (!started_ || out == nullptr || out_len == 0) {
+        return false;
+    }
+    const std::string hex = bench::Sha256(state_->hash).hex();
+    std::snprintf(out, out_len, "%s", hex.c_str());
+    return true;
+}
 
 }  /* namespace legato */
