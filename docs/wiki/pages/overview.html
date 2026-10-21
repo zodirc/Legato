@@ -1,11 +1,11 @@
 <section class="page" data-id="overview" data-group="总览" data-title="阅读说明">
   <div class="card">
     <h2>流程架构</h2>
-    <p class="lede">Legato 是跨平台音视频播放引擎。本导览只记录当前仓库已经实现的两条路径：本地文件播放，以及 <code>corpus://</code> 确定性回归。图是主链详流，正文给出调用点和状态。</p>
+    <p class="lede">Legato 是跨平台音视频播放引擎。本导览只记录当前仓库已经实现的路径：本地文件播放，以及 <code>corpus://</code> 确定性回归。两条路径共用 <code>FilePlayback</code>。图是主链详流，正文给出调用点和状态。</p>
     <h3>1. 怎么读</h3>
     <p>每一张图中间是一条从上到下的主链。左栏是入口或本路径不创建的对象，右栏是失败与旁路，底栏是必须记住的不变量。图上的符号与代码一致；过期时以代码为准。</p>
     <h3>2. 三条主链</h3>
-    <p><a href="#session-entry">会话入口</a>说明 <code>legato_player_load</code> 如何按 URI scheme 分发。<a href="#file-playback">本地播放</a>是 <code>FileSource</code> → <code>FFmpegDemuxer</code> → <code>FFmpegSwDecoder</code> → <code>AlsaSink</code>。<a href="#deterministic">确定性回归</a>不创建这条管线，只推进虚拟媒体时钟。</p>
+    <p><a href="#session-entry">会话入口</a>说明 <code>legato_player_load</code> 入队后返回，打开在会话 IO 线程上完成。<a href="#file-playback">本地播放</a>是 <code>FileSource</code> → <code>FFmpegDemuxer</code> → 每路包队列 → <code>FFmpegSwDecoder</code> → PCM 环或帧队列 → 音频输出线程。<a href="#deterministic">确定性回归</a>走同一条管线，时钟换成虚拟媒体时钟，音频换成 <code>NullAudioSink</code>，视频记录换成 <code>RecordingVideoSink</code>。</p>
     <p class="src">字段与构建见仓库 <code>README.md</code>。图的绘制约束见 <code>.cursor/skills/legato-writing/SKILL.md</code>。</p>
   </div>
 </section>

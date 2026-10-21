@@ -1,12 +1,12 @@
 <section class="page" data-id="deterministic" data-group="流程" data-title="确定性回归">
   <div class="card">
     <h2>确定性回归</h2>
-    <p class="lede"><code>corpus://</code> 是用例标识，不映射到文件系统。该路径不创建 <code>FileSource</code>、解复用器、解码器和 <code>AlsaSink</code>，也不输出 PCM。</p>
+    <p class="lede"><code>corpus://</code> 先核对 <code>testdata/corpus.yaml</code> 的内容哈希，再经 <code>FileSource</code> 进入 <code>FilePlayback</code>。解复用线程把包放进每路队列。该路径不打开 ALSA PCM 设备。音频由 <code>NullAudioSink</code> 按虚拟媒体时钟从 PCM 环消费，呈现记录由 <code>RecordingVideoSink</code> 写入。</p>
     <h3>1. 虚拟媒体时钟</h3>
-    <p><code>load_locked</code> 将 <code>state</code> 置为 <code>loading</code>，并按预设登记首帧定时器。点播 120ms，短视频冷启动 100ms，解码器复用 80ms。时钟只在 <code>legato_engine_advance_us</code> 被调用时前进。到期后发送 <code>first_frame</code>，<code>state</code> 转为 <code>playing</code>。</p>
+    <p><code>begin_load_locked</code> 将 <code>state</code> 置为 <code>loading</code>，并把打开交给会话 IO 线程。时钟只在 <code>legato_engine_advance_us</code> 被调用时前进，内部按 16667 微秒的垂直同步量化。第一帧在第一次同步呈现，<code>first_frame.us</code> 为 16667，与解码耗时无关。</p>
     <h3>2. 基线</h3>
-    <p><code>legato-bench</code> 将结果与 <code>bench/golden/</code> 比对。结果字段 <code>model</code> 的字面量是 <code>headless-skeleton</code>，表示基线来自虚拟媒体时钟。进入稳态后 <code>alloc_steady</code> 的门禁为 0。基线时延是预设常量，不回写本地播放的实测值。两条路径的时间基相互独立。</p>
-    <p class="src"><code>examples/hello.c</code> · <code>bench/src/bench_main.cpp</code> · <code>bench/golden/</code></p>
+    <p><code>legato-bench</code> 将结果与 <code>bench/golden/</code> 比对。结果字段 <code>model</code> 的字面量是 <code>pipeline</code>。基线含呈现 PTS 序列哈希 <code>presentation_sha256</code>。进入稳态后 <code>alloc_steady</code> 的门禁为 0，只统计 <code>tracked_malloc</code>。丢掉一帧时 T1 必须失败。</p>
+    <p class="src"><code>resolve_corpus</code> · <code>NullAudioSink</code> · <code>RecordingVideoSink</code> · <code>bench/golden/</code></p>
   </div>
   <figure class="figure">
     <img src="assets/deterministic-zh.png" alt="确定性回归详流" width="1536" height="1024" />

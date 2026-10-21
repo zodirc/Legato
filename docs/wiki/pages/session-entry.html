@@ -1,12 +1,12 @@
 <section class="page" data-id="session-entry" data-group="流程" data-title="会话入口">
   <div class="card">
     <h2>会话入口</h2>
-    <p class="lede"><code>legato_player_load</code> 在控制线程上执行完才返回。返回值 0 表示命令已受理，不表示媒体已经打开。</p>
+    <p class="lede"><code>legato_player_load</code> 经 <code>Engine::post</code> 入队后返回。返回值 0 表示命令已受理，不表示媒体已经打开。打开在会话 IO 线程上执行，不持有 <code>Engine::mu_</code> 或 <code>Player::mu_</code>。</p>
     <h3>1. 分发</h3>
-    <p><code>Player::load_locked</code> 读取 <code>legato_media_item.uri</code>。<code>corpus:</code> 进入确定性回归。<code>file://</code> 与无 scheme 的路径进入 <code>FilePlayback::open</code>。其它带 <code>://</code> 的 scheme 将 <code>state</code> 置为 <code>error</code>，<code>message</code> 为「这个协议还不能播」。</p>
+    <p>控制线程上的 <code>Player::begin_load_locked</code> 读取 <code>legato_media_item.uri</code>。<code>corpus:</code> 先由 <code>resolve_corpus</code> 核对内容哈希，再排队打开，时钟为虚拟媒体时钟。<code>file://</code> 与无 scheme 的路径经 <code>local_file_path</code> 排队打开，时钟为音频主时钟。其它带 <code>://</code> 的 scheme 将 <code>state</code> 置为 <code>error</code>，错误名 <code>unsupported_scheme</code>，<code>message</code> 为「这个协议还不能播」。</p>
     <h3>2. 打开结果</h3>
-    <p>打开成功时 <code>state=loading</code>。若 <code>playing_intent_</code> 已经置位，<code>FilePlayback::start</code> 立即启动解码线程。打开失败时释放 <code>playback_</code>，<code>file_mode_=false</code>，<code>state=error</code>。空 URI、超长路径分别对应「uri 为空」和「路径太长」。</p>
-    <p class="src"><code>Player::load_uri</code> · <code>local_path</code> · <code>load_locked</code> · <code>engine/src/player.cpp</code></p>
+    <p>排队时 <code>state=loading</code>，并发出 <code>state_changed</code>。IO 线程调用 <code>FilePlayback::open</code>。完成后控制线程执行 <code>finish_open_job</code>：成功则在 <code>playing_intent_</code> 已置位时 <code>start</code>，并发送 <code>command_done</code>；失败则 <code>state=error</code>。空 URI、超长路径分别对应「uri 为空」和「路径太长」。<code>legato_player_release</code> 只标记并投递回收，join 在回收线程上，调用线程立即返回。事件环不覆盖 <code>error</code>、<code>ended</code>、<code>first_frame</code>、<code>state_changed</code>。Seek 与同一属性的 <code>property_changed</code> 各自合并。<code>observe</code> 由控制线程按间隔轮询。</p>
+    <p class="src"><code>Player::begin_load_locked</code> · <code>local_file_path</code> · <code>resolve_corpus</code> · <code>engine/src/player.cpp</code></p>
   </div>
   <figure class="figure">
     <img src="assets/session-entry-zh.png" alt="会话入口详流" width="1536" height="1024" />
