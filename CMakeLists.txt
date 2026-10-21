@@ -160,6 +160,10 @@ enable_testing()
 add_test(NAME core COMMAND legato_core_tests)
 add_test(NAME parse COMMAND legato_parse_tests)
 add_test(NAME smoke COMMAND legato_smoke)
+add_executable(legato_m05_tests tests/m05_tests.c)
+target_compile_options(legato_m05_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(legato_m05_tests PRIVATE legato)
+add_test(NAME m05 COMMAND legato_m05_tests)
 add_test(NAME hello COMMAND legato_hello)
 add_test(NAME idlgen
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/idlgen/idlgen.py --check --root ${CMAKE_CURRENT_SOURCE_DIR})
@@ -170,6 +174,12 @@ add_test(NAME synthetic_dry_run
 add_test(NAME t1_startup
   COMMAND legato-bench run bench/scenarios/startup-local.yaml --golden bench/golden/startup-local.json
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME t1_drop_frame
+  COMMAND legato-bench run bench/scenarios/startup-local.yaml --golden bench/golden/startup-local.json
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(t1_drop_frame PROPERTIES
+  ENVIRONMENT "LEGATO_TEST_DROP_VIDEO_FRAMES=1"
+  WILL_FAIL TRUE)
 add_test(NAME t1_feed
   COMMAND legato-bench run bench/scenarios/feed-swipe-4g.yaml --golden bench/golden/feed-swipe-4g.json
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

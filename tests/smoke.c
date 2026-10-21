@@ -1,7 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "legato/legato.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int g_failures = 0;
 
@@ -32,6 +35,28 @@ static int count_events(legato_player* player, int type) {
     return count;
 }
 
+static int wait_commands(legato_player* player, int need, int* seek_count) {
+    int got = 0;
+    for (int spin = 0; spin < 3000 && got < need; ++spin) {
+        const legato_event* event;
+        int progress = 0;
+        while ((event = legato_player_next_event(player)) != NULL) {
+            progress = 1;
+            if (event->type == LEGATO_EVENT_TYPE_COMMAND_DONE) {
+                ++got;
+            }
+            if (seek_count != NULL && event->type == LEGATO_EVENT_TYPE_SEEK) {
+                ++(*seek_count);
+            }
+        }
+        if (!progress) {
+            const struct timespec pause = {0, 2000000};
+            nanosleep(&pause, NULL);
+        }
+    }
+    return got;
+}
+
 int main(void) {
     CHECK(legato_abi_version() == 1u);
     CHECK(strstr(legato_capabilities(), "\"skeleton\":true") != NULL);
@@ -51,18 +76,22 @@ int main(void) {
 
     CHECK(legato_player_seek(player, 3000000, LEGATO_SEEK_MODE_KEYFRAME) == 0);
     CHECK(legato_player_seek(player, 10000000, LEGATO_SEEK_MODE_PRECISE) == 0);
-    CHECK(count_events(player, LEGATO_EVENT_TYPE_SEEK) == 1);
+    int seeks = 0;
+    CHECK(wait_commands(player, 2, &seeks) == 2);
+    CHECK(seeks == 1);
 
     legato_media_item item;
     memset(&item, 0, sizeof(item));
     item.struct_size = (uint32_t)sizeof(item);
     item.uri = "corpus://startup/local-1080p-h264";
     CHECK(legato_player_load(player, &item) == 0);
+    CHECK(wait_commands(player, 1, NULL) == 1);
     CHECK(legato_player_play(player) == 0);
+    CHECK(wait_commands(player, 1, NULL) == 1);
     CHECK(legato_engine_advance_us(engine, 120000) == 0);
-    CHECK(legato_player_position_us(player) == 10000000);
+    CHECK(legato_player_position_us(player) == 10120000);
     CHECK(legato_engine_advance_us(engine, 1000000) == 0);
-    CHECK(legato_player_position_us(player) == 11000000);
+    CHECK(legato_player_position_us(player) == 11120000);
 
     char* state = NULL;
     CHECK(legato_player_get(player, "state", &state) == 0);
@@ -71,22 +100,24 @@ int main(void) {
 
     char* path = NULL;
     CHECK(legato_player_get(player, "video.output_path", &path) == 0);
-    CHECK(path != NULL && strcmp(path, "\"none\"") == 0);
+    CHECK(path != NULL && strcmp(path, "\"record\"") == 0);
     legato_free(path);
 
     legato_session_stats stats;
     memset(&stats, 0, sizeof(stats));
     stats.struct_size = (uint32_t)sizeof(stats);
     CHECK(legato_player_read_stats(player, &stats) == 0);
-    CHECK(stats.first_frame_us == 120000);
+    CHECK(stats.first_frame_us == 16667);
     CHECK(stats.alloc_steady == 0);
-    CHECK(stats.presented == 1);
+    CHECK(stats.stall_count == 0);
+    CHECK(stats.presented == 34);
 
     /* The coalesced seek was drained above. Load and the first frame are still queued. */
     CHECK(count_events(player, LEGATO_EVENT_TYPE_FIRST_FRAME) == 1);
 
     uint64_t id = legato_player_command(player, "{\"cmd\":\"pause\"}");
     CHECK(id != 0);
+    CHECK(wait_commands(player, 1, NULL) == 1);
     state = NULL;
     CHECK(legato_player_get(player, "state", &state) == 0);
     CHECK(state != NULL && strcmp(state, "\"ready\"") == 0);
