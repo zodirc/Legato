@@ -139,11 +139,15 @@ int FFmpegSwDecoder::receive(FrameView* out) {
     out->height = frame->height;
     out->audio = audio_;
     out->pcm = nullptr;
+    out->data0 = nullptr;
+    out->linesize0 = 0;
     out->nb_samples = 0;
     out->sample_rate = out_rate_;
     out->channels = out_channels_;
     if (!audio_) {
-        av_frame_unref(frame);
+        /* 像素留到下一次 receive。调用方必须在那之前读完 data0。 */
+        out->data0 = frame->data[0];
+        out->linesize0 = frame->linesize[0];
         return 0;
     }
     const int out_samples = swr_get_out_samples(static_cast<SwrContext*>(swr_), frame->nb_samples);

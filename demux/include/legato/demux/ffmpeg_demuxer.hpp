@@ -28,6 +28,8 @@ public:
 
     int open() override;
     int read_packet(PacketView* out) override;
+    /* 把当前包的引用交给调用方。owned 用 release_owned_packet 释放。 */
+    int take_packet(PacketView* out, void** owned);
     void flush(std::uint32_t serial) override;
     int seek_us(std::int64_t pts_us);
 
@@ -46,6 +48,8 @@ private:
     std::int64_t duration_us_ = 0;
     std::uint32_t serial_ = 1;
 };
+
+void release_owned_packet(void* owned);
 
 }  /* namespace legato */
 

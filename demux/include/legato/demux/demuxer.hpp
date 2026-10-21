@@ -10,6 +10,7 @@ struct PacketView {
     int size = 0;
     std::int64_t pts_us = 0;
     std::int64_t dts_us = 0;
+    std::int64_t duration_us = 0;
     int stream_index = 0;
     bool keyframe = false;
     std::uint32_t serial = 0;

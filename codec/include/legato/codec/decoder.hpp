@@ -12,6 +12,8 @@ struct FrameView {
     int channels = 0;
     int nb_samples = 0;
     const std::int16_t* pcm = nullptr;
+    const std::uint8_t* data0 = nullptr;
+    int linesize0 = 0;
     std::int64_t pts_us = 0;
     std::uint32_t serial = 0;
     bool audio = false;

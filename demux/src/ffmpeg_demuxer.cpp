@@ -169,7 +169,38 @@ int FFmpegDemuxer::read_packet(PacketView* out) {
     out->stream_index = packet->stream_index;
     out->keyframe = (packet->flags & AV_PKT_FLAG_KEY) != 0;
     out->serial = serial_;
+    out->duration_us = packet->duration > 0
+                           ? av_rescale_q(packet->duration, stream->time_base, AVRational{1, 1000000})
+                           : 0;
     return 0;
+}
+
+int FFmpegDemuxer::take_packet(PacketView* out, void** owned) {
+    if (owned == nullptr) {
+        return -1;
+    }
+    *owned = nullptr;
+    const int rc = read_packet(out);
+    if (rc != 0) {
+        return rc;
+    }
+    AVPacket* packet = static_cast<AVPacket*>(packet_);
+    AVPacket* clone = av_packet_alloc();
+    if (clone == nullptr || av_packet_ref(clone, packet) < 0) {
+        av_packet_free(&clone);
+        av_packet_unref(packet);
+        return -1;
+    }
+    out->data = clone->data;
+    out->size = clone->size;
+    *owned = clone;
+    av_packet_unref(packet);
+    return 0;
+}
+
+void release_owned_packet(void* owned) {
+    AVPacket* packet = static_cast<AVPacket*>(owned);
+    av_packet_free(&packet);
 }
 
 void FFmpegDemuxer::flush(std::uint32_t serial) {
@@ -186,7 +217,6 @@ int FFmpegDemuxer::seek_us(std::int64_t pts_us) {
     if (av_seek_frame(static_cast<AVFormatContext*>(fmt_), -1, pts_us, AVSEEK_FLAG_BACKWARD) < 0) {
         return -1;
     }
-    ++serial_;
     if (packet_ != nullptr) {
         av_packet_unref(static_cast<AVPacket*>(packet_));
     }
