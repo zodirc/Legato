@@ -2,7 +2,7 @@ id: feed-swipe-4g
 preset: short_video
 tier: T1
 media:
-  playlist: corpus://feed/portrait-1080p-hevc/*
+  playlist: corpus://feed/portrait-1080p-h264/*
   count: 30
 network:
   trace: traces/4g-urban-01.json

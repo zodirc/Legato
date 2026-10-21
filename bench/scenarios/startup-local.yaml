@@ -15,4 +15,5 @@ actions:
   - load
   - play
   - wait_first_frame
-  - watch: 5s
+  - seek: 50s
+  - watch: 15s

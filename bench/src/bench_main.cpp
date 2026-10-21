@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <time.h>
+
 namespace {
 
 std::string read_file(const std::string& path) {
@@ -81,11 +83,12 @@ std::int64_t percentile(std::vector<std::int64_t> samples, double p) {
     return samples[static_cast<size_t>(rank - 1)];
 }
 
-enum class StepKind { Load, Play, Pause, Stop, WaitFirstFrame, Watch, SwipeNext };
+enum class StepKind { Load, Play, Pause, Stop, WaitFirstFrame, Watch, SwipeNext, Seek };
 
 struct Step {
     StepKind kind = StepKind::Load;
     std::int64_t watch_us = 0;
+    std::int64_t position_us = 0;
 };
 
 struct Action {
@@ -134,6 +137,12 @@ Step parse_step(const legato::bench::YamlNode& node) {
     if (watch != nullptr && watch->kind == legato::bench::YamlNode::Scalar) {
         step.kind = StepKind::Watch;
         step.watch_us = parse_duration_us(watch->scalar);
+        return step;
+    }
+    const legato::bench::YamlNode* seek = node.find("seek");
+    if (seek != nullptr && seek->kind == legato::bench::YamlNode::Scalar) {
+        step.kind = StepKind::Seek;
+        step.position_us = parse_duration_us(seek->scalar);
         return step;
     }
     throw std::runtime_error("unsupported action map");
@@ -216,21 +225,41 @@ struct Measured {
     int reused = 0;
     std::uint64_t alloc_steady = 0;
     std::int64_t av_sync_us = 0;
+    std::string presentation_sha256;
     Breakdown breakdown;
     bool have_breakdown = false;
     int runs = 0;
 };
 
-void drain(legato_player* player, std::vector<std::string>* events, bool record) {
+void drain(legato_player* player, std::vector<std::string>* events, bool record, int* command_done) {
     for (;;) {
         const legato_event* event = legato_player_next_event(player);
         if (event == nullptr) {
             return;
         }
+        if (command_done != nullptr && event->type == LEGATO_EVENT_TYPE_COMMAND_DONE) {
+            ++(*command_done);
+        }
         if (record && events != nullptr) {
             events->push_back(legato_event_type_name(event->type));
         }
     }
+}
+
+void wait_commands(legato_player* player, std::vector<std::string>* events, bool record, int need) {
+    int got = 0;
+    for (int spin = 0; spin < 20000 && got < need; ++spin) {
+        const int before = got;
+        drain(player, events, record, &got);
+        if (got >= need) {
+            return;
+        }
+        if (got == before) {
+            const timespec pause = {0, 2000000};
+            nanosleep(&pause, nullptr);
+        }
+    }
+    throw std::runtime_error("command did not finish");
 }
 
 bool wait_first_frame(legato_engine* engine, legato_player* player, std::vector<std::string>* events, bool record) {
@@ -268,16 +297,13 @@ std::string playlist_uri(const std::string& playlist, int index) {
     return prefix + "/" + std::to_string(index);
 }
 
-void load_uri(legato_player* player, const std::string& uri) {
+void post_load(legato_player* player, const std::string& uri) {
     legato_media_item item;
     std::memset(&item, 0, sizeof(item));
     item.struct_size = static_cast<uint32_t>(sizeof(item));
     item.uri = uri.c_str();
     if (legato_player_load(player, &item) != 0) {
         throw std::runtime_error("load failed for " + uri);
-    }
-    if (legato_player_play(player) != 0) {
-        throw std::runtime_error("play failed");
     }
 }
 
@@ -313,8 +339,11 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
     std::string current = scenario.uri;
     if (!scenario.playlist.empty()) {
         current = playlist_uri(scenario.playlist, index);
-        load_uri(player, current);
-        drain(player, &measured->events, record);
+        post_load(player, current);
+        if (legato_player_play(player) != 0) {
+            throw std::runtime_error("play failed");
+        }
+        wait_commands(player, &measured->events, record, 2);
     }
 
     bool failed = false;
@@ -325,17 +354,24 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
                     if (!scenario.playlist.empty()) {
                         current = playlist_uri(scenario.playlist, index);
                     }
-                    load_uri(player, current);
-                    drain(player, &measured->events, record);
+                    post_load(player, current);
+                    wait_commands(player, &measured->events, record, 1);
                 } else if (step.kind == StepKind::Play) {
-                    legato_player_play(player);
-                    drain(player, &measured->events, record);
+                    if (legato_player_play(player) != 0) {
+                        throw std::runtime_error("play failed");
+                    }
+                    wait_commands(player, &measured->events, record, 1);
                 } else if (step.kind == StepKind::Pause) {
                     legato_player_pause(player);
-                    drain(player, &measured->events, record);
+                    wait_commands(player, &measured->events, record, 1);
                 } else if (step.kind == StepKind::Stop) {
                     legato_player_command(player, "{\"cmd\":\"stop\"}");
-                    drain(player, &measured->events, record);
+                    wait_commands(player, &measured->events, record, 1);
+                } else if (step.kind == StepKind::Seek) {
+                    if (legato_player_seek(player, step.position_us, LEGATO_SEEK_MODE_PRECISE) != 0) {
+                        throw std::runtime_error("seek failed");
+                    }
+                    wait_commands(player, &measured->events, record, 1);
                 } else if (step.kind == StepKind::WaitFirstFrame) {
                     if (!wait_first_frame(engine, player, &measured->events, record)) {
                         failed = true;
@@ -366,12 +402,18 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
                         failed = true;
                         break;
                     }
-                    drain(player, &measured->events, record);
+                    drain(player, &measured->events, record, nullptr);
                 } else if (step.kind == StepKind::SwipeNext) {
+                    if (scenario.count > 0 && index + 1 >= scenario.count) {
+                        continue;
+                    }
                     ++index;
                     current = playlist_uri(scenario.playlist, index);
-                    load_uri(player, current);
-                    drain(player, &measured->events, record);
+                    post_load(player, current);
+                    if (legato_player_play(player) != 0) {
+                        throw std::runtime_error("play failed");
+                    }
+                    wait_commands(player, &measured->events, record, 2);
                 }
             }
             if (failed) {
@@ -394,6 +436,7 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
             measured->alloc_steady = stats.alloc_steady;
         }
         measured->av_sync_us = stats.av_sync_us;
+        measured->presentation_sha256 = stats.presentation_sha256;
         measured->runs += 1;
     }
     if (failed) {
@@ -428,7 +471,7 @@ std::string format_result(const Scenario& scenario, const Measured& measured, co
            "\", \"config\": \"skeleton\", \"ffmpeg\": \"none\", \"quirks_db\": \"none\"},\n";
     out += "  \"env\": {\"tier\": \"" + scenario.tier +
            "\", \"device\": \"headless\", \"os\": \"linux\", \"backend\": \"legato\", "
-           "\"model\": \"headless-skeleton\", \"preset\": \"" +
+           "\"model\": \"pipeline\", \"preset\": \"" +
            scenario.preset + "\", \"simulated_network\": false, \"network_trace\": \"" + scenario.network_trace +
            "\"},\n";
     out += "  \"runs\": " + std::to_string(measured.runs) + ",\n";
@@ -475,6 +518,7 @@ std::string format_result(const Scenario& scenario, const Measured& measured, co
         out += "\"" + measured.events[i] + "\"";
     }
     out += "],\n";
+    out += "  \"presentation_sha256\": \"" + measured.presentation_sha256 + "\",\n";
     out += std::string("  \"gates\": {\"alloc_steady_eq_0\": ") + json_bool(alloc_ok) +
            ", \"av_sync_p95_lt_40ms\": " + json_bool(av_ok) + "}\n";
     out += "}\n";
