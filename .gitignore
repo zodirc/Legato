@@ -1,6 +1,7 @@
 build/
 third_party/ffmpeg/src/
 third_party/ffmpeg/dist/
+third_party/host/
 media-engine-design.md
 cmake-build-*/
 .cache/
