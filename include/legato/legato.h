@@ -140,6 +140,8 @@ LEGATO_API void legato_test_set_open_delay_us(int64_t delay_us);
 LEGATO_API int legato_test_last_seek_mode(void);
 LEGATO_API int legato_test_video_decoder_opens(void);
 LEGATO_API void legato_test_reset_video_decoder_opens(void);
+LEGATO_API int legato_test_video_packets(void);
+LEGATO_API void legato_test_reset_video_packets(void);
 LEGATO_API void legato_test_set_pcm_output(int enable);
 LEGATO_API void legato_test_kick_decode_delay_us(int64_t delay_us);
 LEGATO_API int legato_test_decode_delay_started(void);

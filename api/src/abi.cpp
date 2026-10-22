@@ -362,6 +362,10 @@ int legato_test_video_decoder_opens(void) { return legato::test_video_decoder_op
 
 void legato_test_reset_video_decoder_opens(void) { legato::reset_test_video_decoder_opens(); }
 
+int legato_test_video_packets(void) { return legato::test_video_packets(); }
+
+void legato_test_reset_video_packets(void) { legato::reset_test_video_packets(); }
+
 void legato_test_set_pcm_output(int enable) { legato::set_test_pcm_output(enable); }
 
 void legato_test_kick_decode_delay_us(int64_t delay_us) { legato::kick_test_decode_delay_us(delay_us); }

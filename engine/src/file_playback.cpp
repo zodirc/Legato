@@ -166,6 +166,10 @@ int FilePlayback::open(const char* path) {
                 return -1;
             }
         }
+    } else if (impl_->demux->video() != nullptr) {
+        /* 预设不要视频时，视频包不能进入解复用循环。交错文件仍要读到后面的音频，
+           所以让 FFmpeg 丢弃视频轨，而不是把包读出来再释放。 */
+        impl_->demux->discard_video();
     }
     stages_.decoder_open_us = elapsed();
     if (!impl_->audio && !impl_->video) {
@@ -468,13 +472,17 @@ void FilePlayback::demux_main() {
         packet.duration_us = view.duration_us;
         packet.serial = view.serial;
         packet.release = release_owned_packet;
+        if (const FFmpegDemuxer::Stream* video = impl_->demux->video()) {
+            if (view.stream_index == video->index) {
+                note_test_video_packet();
+            }
+        }
         bool queued = false;
         if (view.stream_index == impl_->audio_index && impl_->audio) {
             queued = impl_->audio_q->put(packet) == 0;
         } else if (decode_video_ && view.stream_index == impl_->video_index && impl_->video) {
             queued = impl_->video_q->put(packet) == 0;
         }
-        /* video 为假时不建视频解码器。交错文件仍要取出视频包，否则读不到后面的音频。这些包不入队。 */
         if (!queued) {
             release_owned_packet(owned);
         } else if (!reached_start_.load() && buffered_span_us() >= start_us) {
