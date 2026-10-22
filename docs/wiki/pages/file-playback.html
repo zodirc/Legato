@@ -1,14 +1,14 @@
 <section class="page" data-id="file-playback" data-group="流程" data-title="本地播放">
   <div class="card">
     <h2>本地文件播放</h2>
-    <p class="lede">管线为 <code>FileSource</code> → <code>FFmpegDemuxer</code> → 每路包队列 → <code>FFmpegSwDecoder</code> → PCM 环或帧队列 → 音频输出线程。打开在会话 IO 线程上。控制线程只改标志。</p>
+    <p class="lede">管线为 <code>FileSource</code> → <code>FFmpegDemuxer</code> → 每路包队列 → <code>FFmpegSwDecoder</code> → PCM 环或帧队列 → 音频输出线程。打开在会话 IO 线程上。<code>Player::io_main</code> 注入 <code>AudioMasterClock</code> 和 <code>AlsaSink</code>；没有音频流时改为 <code>MonotonicClock</code>。控制线程只写 <code>serial</code> 和目标位置。</p>
     <h3>1. 打开与队列</h3>
-    <p><code>FFmpegDemuxer</code> 使用 <code>AVFMT_FLAG_CUSTOM_IO</code>，字节来自 <code>DataSource</code>。解复用线程按流把包放进队列。时长上限是预设的 <code>buffer_max_s</code>，字节上限是这个秒数乘以 1 MiB/s。视频帧队列容量 8。包和帧带 <code>serial</code>。存在音频流时必须打开 ALSA PCM 设备，输出为交错 S16。视频帧不送显示 Sink。</p>
+    <p><code>FFmpegDemuxer</code> 使用 <code>AVFMT_FLAG_CUSTOM_IO</code>，字节来自 <code>DataSource</code>。解复用线程按流把包放进队列。时长上限是预设的 <code>buffer_max_s</code>，字节上限是这个秒数乘以 1 MiB/s。视频帧队列容量 8。包和帧带 <code>serial</code>。存在音频流时必须打开 ALSA PCM 设备，输出为交错 S16。视频帧交给 <code>CountingVideoSink</code>，只计数，不画。</p>
     <h3>2. 主时钟与流结束</h3>
-    <p>音频输出线程从 PCM 环取出样本再写入设备。音频主时钟为 <code>origin_us + (written_frames - snd_pcm_delay) * 1000000 / rate</code>。首次写入成功调用 <code>media_first_frame</code>。EOF 之后取出重采样残余样本，再 <code>snd_pcm_drain</code>。drain 期间若暂停或 Seek 已经置位，不发送 EOS。</p>
+    <p>音频输出线程从 PCM 环取出样本再写入设备。主时钟只在 <code>AudioMasterClock::observe_delay</code> 计算，公式是 <code>origin_us + (written_frames - delay_frames) * 1000000 / rate</code>。首次写入成功后，输出线程把首帧写入通知环，控制线程调用 <code>media_first_frame</code>。EOF 之后取出重采样残余样本，再 <code>snd_pcm_drain</code>。drain 期间若暂停或 Seek 已经置位，不发送 EOS。输出线程看到新 <code>serial</code> 后清零写入帧数和首帧标记。</p>
     <h3>3. 传输控制</h3>
-    <p>暂停调用 <code>AlsaSink::drop</code>。设备欠载才 <code>snd_pcm_recover</code>。包队列见底时 <code>state</code> 变为 <code>buffering</code>，<code>stall_count</code> 加一。<code>FilePlayback::stop</code> 不能在持有 <code>Player::mu_</code> 时执行，因为音频输出线程回调 <code>media_first_frame</code> 需要同一把锁。</p>
-    <p class="src"><code>FilePlayback::open</code> · <code>run</code> · <code>stop</code> · <code>engine/src/file_playback.cpp</code></p>
+    <p>暂停调用 <code>AudioSink::drop</code>。设备欠载才 <code>snd_pcm_recover</code>。包队列见底时输出线程写入卡顿通知，控制线程把 <code>state</code> 变为 <code>buffering</code>，<code>stall_count</code> 加一。<code>FilePlayback::stop</code> 不能在持有 <code>Player::mu_</code> 时执行，因为解复用线程调用 <code>media_failed</code> 需要同一把锁。输出线程不拿这把锁。</p>
+    <p class="src"><code>FilePlayback::open</code> · <code>audio_out_main</code> · <code>stop</code> · <code>engine/src/file_playback.cpp</code></p>
   </div>
   <figure class="figure">
     <img src="assets/file-playback-zh.png" alt="本地文件播放主链" width="1536" height="1024" />

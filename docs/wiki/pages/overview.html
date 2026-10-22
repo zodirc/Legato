@@ -5,7 +5,7 @@
     <h3>1. 怎么读</h3>
     <p>每一张图中间是一条从上到下的主链。左栏是入口或本路径不创建的对象，右栏是失败与旁路，底栏是必须记住的不变量。图上的符号与代码一致；过期时以代码为准。</p>
     <h3>2. 三条主链</h3>
-    <p><a href="#session-entry">会话入口</a>说明 <code>legato_player_load</code> 入队后返回，打开在会话 IO 线程上完成。<a href="#file-playback">本地播放</a>是 <code>FileSource</code> → <code>FFmpegDemuxer</code> → 每路包队列 → <code>FFmpegSwDecoder</code> → PCM 环或帧队列 → 音频输出线程。<a href="#deterministic">确定性回归</a>走同一条管线，时钟换成虚拟媒体时钟，音频换成 <code>NullAudioSink</code>，视频记录换成 <code>RecordingVideoSink</code>。</p>
+    <p><a href="#session-entry">会话入口</a>说明 <code>legato_player_load</code> 入队后返回，打开在会话 IO 线程上完成。<a href="#file-playback">本地播放</a>是 <code>FileSource</code> → <code>FFmpegDemuxer</code> → 每路包队列 → <code>FFmpegSwDecoder</code> → PCM 环或帧队列 → 音频输出线程。<a href="#deterministic">确定性回归</a>走同一条管线。<code>Player::io_main</code> 注入虚拟媒体时钟、<code>NullAudioSink</code> 和 <code>RecordingVideoSink</code>。</p>
     <p class="src">字段与构建见仓库 <code>README.md</code>。图的绘制约束见 <code>.cursor/skills/legato-writing/SKILL.md</code>。</p>
   </div>
 </section>
