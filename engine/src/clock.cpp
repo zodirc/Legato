@@ -6,7 +6,7 @@ namespace legato {
 
 void VirtualClock::advance_us(std::int64_t delta_us) {
     if (delta_us > 0) {
-        now_ += delta_us;
+        now_.fetch_add(delta_us, std::memory_order_release);
     }
 }
 

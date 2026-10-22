@@ -14,16 +14,15 @@ public:
     int open(int sample_rate, int channels) override;
     void present(std::int64_t pts_us) override;
     void close() override;
-
     /* >0 写入的帧数；0 被 drop 打断（暂停或 seek）；<0 设备错误。 */
-    int write_frames(const std::int16_t* interleaved, int frames);
-    void drop();
-    /* drop 会留下中断标记，seek 之后由工作线程清掉，否则下一包会被直接丢掉。 */
-    void end_interrupt();
-    void drain();
-    int delay_frames() const;
-    int rate() const { return rate_; }
-    int channels() const { return channels_; }
+    int write_frames(const std::int16_t* interleaved, int frames) override;
+    void drop() override;
+    /* drop 会留下中断标记。Seek 在解复用线程上 end_interrupt，否则下一包会被直接丢掉。 */
+    void end_interrupt() override;
+    void drain() override;
+    int delay_frames() const override;
+    int rate() const override { return rate_; }
+    int channels() const override { return channels_; }
 
 private:
     void* pcm_ = nullptr;
