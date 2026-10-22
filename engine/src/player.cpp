@@ -4,12 +4,17 @@
 
 #include "legato/core/alloc.hpp"
 #include "legato/core/log.hpp"
+#include "legato/engine/clock.hpp"
 #include "legato/engine/corpus.hpp"
 #include "legato/engine/error_info.hpp"
 #include "legato/engine/file_playback.hpp"
+#include "legato/engine/output_note.hpp"
 #include "legato/engine/test_hooks.hpp"
 #include "legato/pal/clock.hpp"
 #include "legato/render/sink.hpp"
+#if defined(LEGATO_HAS_ALSA)
+#include "legato/render/alsa_sink.hpp"
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -67,8 +72,14 @@ void Player::request_release() {
         if (self->io_.joinable()) {
             self->io_.join();
         }
-        if (self->playback_) {
-            self->playback_->stop();
+        /* playback_ 可能正被控制线程的 finish_open_job 换掉，先在锁里取出再停。 */
+        std::shared_ptr<FilePlayback> playback;
+        {
+            std::lock_guard<std::mutex> lock(self->mu_);
+            playback = self->playback_;
+        }
+        if (playback) {
+            playback->stop();
         }
         std::lock_guard<std::mutex> lock(self->engine_->mu_);
         self->engine_->scheduler_.cancel(self->id_);
@@ -287,12 +298,35 @@ void Player::io_main() {
             job = io_job_;
             io_job_.pending = false;
         }
-        Clock* clock = job.virtual_clock ? &engine_->virtual_clock() : nullptr;
-        auto playback = std::make_unique<FilePlayback>(this, clock, job.virtual_clock, job.decode_video,
-                                                       job.buffer_start_s, job.buffer_resume_s, job.buffer_max_s);
+        std::unique_ptr<AudioSink> audio;
+        std::unique_ptr<VideoSink> video;
+        std::unique_ptr<AudioMasterClock> master;
+        Clock* clock = nullptr;
+        if (job.virtual_clock) {
+            audio = std::make_unique<NullAudioSink>();
+            video = std::make_unique<RecordingVideoSink>();
+            clock = &engine_->virtual_clock();
+        } else {
+#if defined(LEGATO_HAS_ALSA)
+            audio = std::make_unique<AlsaSink>();
+#else
+            audio = std::make_unique<UnavailableAudioSink>();
+#endif
+            video = std::make_unique<CountingVideoSink>();
+            master = std::make_unique<AudioMasterClock>();
+            clock = master.get();
+        }
+        auto playback = std::make_shared<FilePlayback>(this, clock, std::move(audio), std::move(video), std::move(master),
+                                                       job.decode_video, job.buffer_start_s, job.buffer_resume_s,
+                                                       job.buffer_max_s);
         const int rc = playback->open(job.path);
-        auto held = std::make_shared<std::unique_ptr<FilePlayback>>(std::move(playback));
-        engine_->post([this, job, held, rc] { finish_open_job(job, std::move(*held), rc); });
+        if (rc == 0 && !job.virtual_clock && !playback->has_audio()) {
+            playback->bind_clock(playback->monotonic_clock());
+        }
+        /* 本线程随后就回到等待。回收线程 join 完可能丢掉 Player 的最后一份所有权，
+           控制线程还没跑 finish_open_job。回调留着 shared_ptr，对象才活得到那一次。 */
+        std::shared_ptr<Player> self = shared_from_this();
+        engine_->post([self, job, playback, rc] { self->finish_open_job(job, playback, rc); });
     }
 }
 
@@ -302,8 +336,8 @@ void Player::finish_open(std::uint64_t generation, std::uint64_t command_id, boo
     (void)ok;
 }
 
-void Player::finish_open_job(const OpenJob& job, std::unique_ptr<FilePlayback> playback, int rc) {
-    std::unique_ptr<FilePlayback> drop;
+void Player::finish_open_job(const OpenJob& job, std::shared_ptr<FilePlayback> playback, int rc) {
+    std::shared_ptr<FilePlayback> drop;
     bool wake = false;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -405,26 +439,69 @@ void Player::media_ended() {
     dispatch(wake);
 }
 
-void Player::media_failed(const char* message) {
+void Player::media_failed(const char* name, const char* message) {
     bool wake = false;
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (!file_mode_) {
             return;
         }
-        const char* text = message != nullptr ? message : "播放失败";
-        const char* name = "decode_failed";
-        if (std::strcmp(text, "定位失败") == 0) {
-            name = "seek_failed";
-        } else if (std::strcmp(text, "读包失败") == 0) {
-            name = "demux_failed";
-        } else if (std::strcmp(text, "声卡写入失败") == 0) {
-            name = "audio_device_unavailable";
-        }
-        set_error_locked(name, text);
+        /* 错误名由通知方传入。文案只写入 message，不参与选择 category。 */
+        set_error_locked(name != nullptr ? name : "decode_failed", message != nullptr ? message : "播放失败");
         wake = true;
     }
     dispatch(wake);
+}
+
+void Player::schedule_note_drain() {
+    if (note_drain_posted_.exchange(true)) {
+        return;
+    }
+    std::shared_ptr<Player> self;
+    try {
+        self = shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        note_drain_posted_.store(false);
+        return;
+    }
+    engine_->post([self] { self->apply_notes(); });
+}
+
+void Player::apply_notes() {
+    note_drain_posted_.store(false);
+    std::shared_ptr<FilePlayback> playback;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        playback = playback_;
+    }
+    if (!playback) {
+        return;
+    }
+    OutputNote note;
+    while (playback->pop_note(&note)) {
+        switch (note.kind) {
+        case OutputNote::FirstFrame:
+            media_first_frame(note.position_us, note.extra_us);
+            break;
+        case OutputNote::Stall:
+            note_stall();
+            break;
+        case OutputNote::Resume:
+            note_buffer_resumed();
+            break;
+        case OutputNote::Failed:
+            media_failed(note.name, note.message);
+            break;
+        case OutputNote::Ended:
+            media_ended();
+            break;
+        case OutputNote::None:
+            break;
+        }
+    }
+    if (playback->notes_pending()) {
+        schedule_note_drain();
+    }
 }
 
 void Player::note_stall() {
@@ -602,7 +679,7 @@ int Player::load_uri(const char* uri, std::uint64_t* command_id) {
         id = bump_locked(command_id);
     }
     engine_->post([this, copy, id] {
-        std::unique_ptr<FilePlayback> old;
+        std::shared_ptr<FilePlayback> old;
         bool wake = false;
         {
             std::lock_guard<std::mutex> self_lock(mu_);
@@ -871,18 +948,18 @@ int Player::default_seek_mode() const {
 }
 
 void Player::prepare_advance(std::int64_t delta_us) {
-    FilePlayback* playback = nullptr;
+    std::shared_ptr<FilePlayback> playback;
     std::int64_t target = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (released_ || !virtual_session_ || playback_ == nullptr || !playing_intent_) {
             return;
         }
-        playback = playback_.get();
+        playback = playback_;
         const std::int64_t now = engine_->virtual_clock().now_us();
         target = segment_media_us_ + (now + delta_us - segment_virtual_us_);
     }
-    if (playback != nullptr) {
+    if (playback) {
         playback->wait_decoded(target);
     }
 }
@@ -962,7 +1039,7 @@ int Player::attach_surface(void* handle) {
 }
 
 void Player::on_clock_advanced() {
-    FilePlayback* playback = nullptr;
+    std::shared_ptr<FilePlayback> playback;
     std::int64_t elapsed = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -973,7 +1050,7 @@ void Player::on_clock_advanced() {
             update_position_locked();
             return;
         }
-        playback = playback_.get();
+        playback = playback_;
         elapsed = engine_->virtual_clock().now_us() - segment_virtual_us_;
         if (elapsed < 0) {
             elapsed = 0;
@@ -984,7 +1061,7 @@ void Player::on_clock_advanced() {
     bool wake = false;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (released_ || playback_.get() != playback) {
+        if (released_ || playback_.get() != playback.get()) {
             return;
         }
         const std::int64_t now = engine_->virtual_clock().now_us();

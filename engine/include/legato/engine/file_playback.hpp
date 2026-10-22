@@ -1,7 +1,12 @@
 #ifndef LEGATO_ENGINE_FILE_PLAYBACK_HPP
 #define LEGATO_ENGINE_FILE_PLAYBACK_HPP
 
+#include "legato/engine/clock.hpp"
+#include "legato/engine/output_note.hpp"
 #include "legato/engine/pipeline.hpp"
+#include "legato/render/sink.hpp"
+
+#include "legato/core/spsc_ring.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -12,12 +17,15 @@
 
 namespace legato {
 
-class Clock;
+class FrameQueue;
+class PcmQueue;
 class Player;
+class VideoPresenter;
 
-/* 本地文件会话。解复用、每路解码、PCM 输出各占一个线程。
-   控制线程只改标志。持有 Player::mu_ 时不能 join 这些线程，
-   因为它们回调 media_first_frame 需要同一把锁。 */
+/* 本地文件与确定性回归共用这一条管线。时钟和 Sink 由 Player::io_main 注入。
+   控制线程只写 serial 和目标位置。写入帧数、首帧标记由输出线程在看到新 serial 时清零。
+   输出线程不拿 Player::mu_，首帧、卡顿、恢复和失败写入通知环，由控制线程改 state。
+   持有 Player::mu_ 时不能 join 解复用线程：它回调 media_failed 需要这把锁。 */
 
 class FilePlayback : public Pipeline {
 public:
@@ -38,7 +46,8 @@ public:
         char sha256[65]{};
     };
 
-    FilePlayback(Player* player, Clock* clock, bool virtual_clock, bool decode_video, double buffer_start_s,
+    FilePlayback(Player* player, Clock* clock, std::unique_ptr<AudioSink> audio, std::unique_ptr<VideoSink> video,
+                 std::unique_ptr<AudioMasterClock> master, bool decode_video, double buffer_start_s,
                  double buffer_resume_s, double buffer_max_s);
     ~FilePlayback() override;
 
@@ -59,28 +68,47 @@ public:
     const Stages& stages() const { return stages_; }
     const char* error_name() const { return error_name_; }
     const char* error_message() const { return error_message_; }
-    bool is_virtual() const { return virtual_; }
+    bool has_audio() const;
+    void bind_clock(Clock* clock);
+    Clock* monotonic_clock() { return &monotonic_; }
+    bool pop_note(OutputNote* out);
+    bool notes_pending() const;
 
 private:
+    friend class VideoPresenter;
+
     struct Impl;
     void launch_threads();
     void demux_main();
     void audio_main();
     void video_main();
     void audio_out_main(bool software);
-    void video_drain_main();
     bool apply_seek();
     std::int64_t buffered_span_us() const;
     bool queues_bottom() const;
     void note_bottom();
-    void note_resumed();
+    void note_resumed(bool via_ring);
     void wake();
+    void emit_output(const OutputNote& note);
+    FrameQueue* frames();
+    PcmQueue* pcm();
+    bool has_video() const;
+    int sample_rate() const;
+    int sample_channels() const;
 
     Player* player_ = nullptr;
     Clock* clock_ = nullptr;
+    std::unique_ptr<AudioSink> audio_own_;
+    std::unique_ptr<VideoSink> video_own_;
+    std::unique_ptr<AudioMasterClock> master_own_;
+    AudioSink* audio_sink_ = nullptr;
+    VideoSink* video_sink_ = nullptr;
+    AudioMasterClock* master_ = nullptr;
+    MonotonicClock monotonic_;
     std::unique_ptr<Impl> impl_;
-    bool virtual_ = false;
+    std::unique_ptr<VideoPresenter> presenter_;
     bool decode_video_ = true;
+    bool realtime_audio_ = false;
     double buffer_start_s_ = 1.5;
     double buffer_resume_s_ = 3;
     double buffer_max_s_ = 50;
@@ -112,6 +140,11 @@ private:
     std::atomic<bool> reached_start_{false};
     std::atomic<bool> stall_latched_{false};
     std::atomic<std::int64_t> empty_since_us_{0};
+    /* 只由 PCM 输出线程写。控制线程改 serial 后，本线程看到新值再清零。 */
+    std::int64_t written_frames_ = 0;
+    bool saw_audio_ = false;
+    std::uint32_t audio_epoch_ = 0;
+    SpscRing<OutputNote, 32> notes_;
 };
 
 }  /* namespace legato */
