@@ -8,7 +8,7 @@ Legato 是跨平台音视频播放引擎。实现语言为 C++20，稳定接口�
 - `legato_play`：本地文件播放示例。PCM 经 ALSA 输出，直至流结束（EOS）。
 - `legato-bench`：确定性回归工具。对 `corpus://` 用例推进虚拟媒体时钟，将首帧时延、事件序和稳态分配与基线比对。
 
-本地文件的视频基本流会被解码。当前未接入显示 Sink：帧交给 `CountingVideoSink`，只计数，不画到窗口。确定性回归把呈现时间戳和帧指纹写入记录 Sink。预设 `video` 为假时不打开视频解码器，也不向解码器送视频包。时钟和 Sink 由 `Player::io_main` 注入。
+本地文件的视频基本流会被解码。当前未接入显示 Sink：帧交给 `CountingVideoSink`，只计数，不画到窗口。确定性回归把呈现时间戳和帧指纹写入记录 Sink。预设 `video` 为假时不打开视频解码器，解复用也不读出视频包。时钟和 Sink 由 `Player::io_main` 注入。
 
 本文档按统一三段式编排：
 
@@ -81,7 +81,7 @@ Legato 是跨平台音视频播放引擎。实现语言为 C++20，稳定接口�
 
 1. **入口**
    - `examples/hello.c`、`tests/smoke.c`、`legato-bench run bench/scenarios/<name>.yaml`。
-   - `resolve_corpus` 核对清单中的 SHA-256。清单项带 `path` 时 URI 必须整段相等。带 `path_prefix` 时 URI 形如 `corpus://feed/portrait-1080p-h264/0`。
+   - `legato_engine_create` 的配置 JSON 给出 `corpus_root`。`liblegato` 不编入源码路径。`resolve_corpus` 在这个根目录下核对清单中的 SHA-256。清单项带 `path` 时 URI 必须整段相等。带 `path_prefix` 时 URI 形如 `corpus://feed/portrait-360p-h264/0`。未设置根目录时 `message` 为「corpus 根目录未设置」。
 2. **虚拟媒体时钟**
    - 时钟只在 `legato_engine_advance_us` 被调用时前进。调用线程先等到起播缓冲够了，控制线程再按 16667 微秒的垂直同步量化；每一步都等这一步的 PCM 和视频帧。
    - 第一帧在第一次垂直同步呈现。`first_frame.us` 为 16667，与解码耗时无关。
@@ -148,7 +148,7 @@ Legato 是跨平台音视频播放引擎。实现语言为 C++20，稳定接口�
 - `category` <- `error_info(code)->category`
 - `code` <- 调用点传入的错误名。打开或哈希失败为 `source_open_failed`，scheme 不支持为 `unsupported_scheme`，解复用失败为 `demux_failed`，Seek 失败为 `seek_failed`，解码失败为 `decode_failed`，PCM 设备打开失败为 `audio_device_unavailable`。空 URI 和路径过长仍是 `invalid_argument`
 - `retryable` <- `error_info(name)->retryable`，由 `idl/errors.yaml` 生成
-- `message` <- 调用点字符串：`打不开这个文件`、`这个协议还不能播`、`路径太长`、`uri 为空`、`读包失败`、`音频解码失败`、`视频解码失败`、`声卡写入失败`、`定位失败`
+- `message` <- 调用点字符串：`打不开这个文件`、`这个协议还不能播`、`路径太长`、`uri 为空`、`corpus 根目录未设置`、`读包失败`、`音频解码失败`、`视频解码失败`、`声卡写入失败`、`定位失败`
 - `hint` <- 错误表。`unsupported_scheme` 的 hint 写明当前支持 `file` 和 `corpus`
 - `trace_id` <- 每次 `load` 生成的 `p-` 加 16 位十六进制，不是常量
 - `state` 为 `"error"` 时，`legato_play` 将整段 JSON 写入标准错误，进程退出码为 1
@@ -164,7 +164,7 @@ Legato 是跨平台音视频播放引擎。实现语言为 C++20，稳定接口�
 ### 2.4 URI
 - `uri` <- `legato_media_item.uri` <- `legato_player_load`
 - `local_file_path` 去掉 `file://` 前缀及可选的 `localhost`。盘符形式 `file:///C:/a.mp4` 得到 `C:/a.mp4`，`file://host/share` 得到 `//host/share`
-- `corpus://...` <- `resolve_corpus` <- 核对 `testdata/corpus.yaml` 后得到媒体路径
+- `corpus://...` <- `resolve_corpus` <- `legato_engine_create` 的 `corpus_root` 下核对 `testdata/corpus.yaml` 后得到媒体路径
 
 ---
 
@@ -215,7 +215,7 @@ python3 tools/idlgen/idlgen.py --check
 - `bench/`：回归场景与基线。
 - `examples/play.c`：本地文件播放。`examples/hello.c`：确定性回归示例。
 - `docs/wiki/`：流程架构导览。在线地址是 https://zodirc.github.io/Legato/wiki/ 。Pages 源选择 GitHub Actions，由 `.github/workflows/docs-pages.yml` 发布 `docs/`。
-- `testdata/corpus.yaml`：确定性回归用例清单。媒体字节由 `python3 testdata/generate_synthetic.py --corpus` 生成，不纳入版本库。
+- `testdata/corpus.yaml`：确定性回归用例清单。`feed-swipe-4g` 使用短边 360 的 `portrait-360p-h264`，30 条，每条 5 秒。1080 竖屏条目 `tier: T2`，T1 不生成。媒体字节由 `python3 testdata/generate_synthetic.py --corpus` 生成，不纳入版本库。`--check` 核对哈希，不一致则失败，不回写清单。
 
 ### 3.3 示例进程的超时
 - `legato_play` 每 100ms 打印 `position_us / 1000` 和带引号的 `state`。
@@ -223,15 +223,16 @@ python3 tools/idlgen/idlgen.py --check
 - EOS 时退出码为 0。进入 `error` 时退出码为 1。
 
 ### 3.4 验证
-1. `make test`。`play_tone` 应在约 1.2 秒后打印「结束」。`smoke` 与 `symbols` 通过，动态库导出符号限于 `legato_`。`t1_drop_frame` 在丢掉一帧后必须和 `bench/golden/startup-local.json` 对不上。
-2. `./build/legato_play /tmp/does-not-exist.wav` 在打开失败后以退出码 1 结束，`last_error.message` 为「打不开这个文件」。
-3. `./build/legato_hello` 在 `advance_us(120000)` 再 `advance_us(5000000)` 之后，`position_us` 为 5120000。
-4. wav、mp3、aac，以及含 h264 与 aac 的 mp4，经 `legato_play` 应完成 PCM 输出并打印「结束」。视频帧只计数，不画到窗口。
+1. `make test`。`play_tone` 应在约 1.2 秒后打印「结束」。`smoke` 与 `symbols` 通过，动态库导出符号限于 `legato_`。`t1_drop_frame` 在丢掉一帧后必须和 `bench/golden/startup-local.json` 对不上。`t1_startup`、`t1_drop_frame`、`t1_feed` 的 ctest 超时是 120 秒。
+2. `.github/workflows/t1.yml` 构建 FFmpeg，生成清单后执行 `generate_synthetic.py --check`。哈希不符则失败，不回写清单。TSan 和 ASan 作业只跑 `m05` 和 `t1_startup`。
+3. `./build/legato_play /tmp/does-not-exist.wav` 在打开失败后以退出码 1 结束，`last_error.message` 为「打不开这个文件」。
+4. `./build/legato_hello` 在 `advance_us(120000)` 再 `advance_us(5000000)` 之后，`position_us` 为 5120000。
+5. wav、mp3、aac，以及含 h264 与 aac 的 mp4，经 `legato_play` 应完成 PCM 输出并打印「结束」。视频帧只计数，不画到窗口。
 
 ### 3.5 代码依据
 - URI 分发与错误：`local_file_path`、`begin_load_locked`、`resolve_corpus`、`set_error_locked` <- `engine/include/legato/engine/uri_path.hpp`、`engine/src/player.cpp`、`engine/src/corpus.cpp`
-- 打开、读包、EOS、seek、纯视频调度：`FilePlayback::open`、`run` <- `engine/src/file_playback.cpp`
-- AVIO 与时间基：`FFmpegDemuxer::open`、`read_packet`、`seek_us` <- `demux/src/ffmpeg_demuxer.cpp`
+- 打开、读包、EOS、seek、纯视频调度：`FilePlayback::open`、`audio_out_main`、`stop` <- `engine/src/file_playback.cpp`
+- AVIO 与时间基：`FFmpegDemuxer::open`、`discard_video`、`read_packet`、`seek_us` <- `demux/src/ffmpeg_demuxer.cpp`
 - 重采样残余与 seek 后清空：`pull_delayed`、`flush` <- `codec/src/ffmpeg_sw_decoder.cpp`
 - PCM 设备：`write_frames`、`drop`、`end_interrupt`、`drain`、`delay_frames` <- `render/src/alsa_sink.cpp`
 - 示例进程：`examples/play.c`

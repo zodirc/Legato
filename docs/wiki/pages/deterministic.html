@@ -1,7 +1,7 @@
 <section class="page" data-id="deterministic" data-group="流程" data-title="确定性回归">
   <div class="card">
     <h2>确定性回归</h2>
-    <p class="lede"><code>corpus://</code> 先核对 <code>testdata/corpus.yaml</code> 的内容哈希，再经 <code>FileSource</code> 进入 <code>FilePlayback</code>。解复用线程把包放进每路队列。该路径不打开 ALSA PCM 设备。<code>Player::io_main</code> 注入 <code>VirtualClock</code>、<code>NullAudioSink</code> 和 <code>RecordingVideoSink</code>。挑帧在 <code>VideoPresenter::present_until</code>。</p>
+    <p class="lede"><code>corpus://</code> 的根目录来自 <code>legato_engine_create</code> 的 <code>corpus_root</code>。先核对 <code>testdata/corpus.yaml</code> 的内容哈希，再经 <code>FileSource</code> 进入 <code>FilePlayback</code>。解复用线程把包放进每路队列。该路径不打开 ALSA PCM 设备。<code>Player::io_main</code> 注入 <code>VirtualClock</code>、<code>NullAudioSink</code> 和 <code>RecordingVideoSink</code>。挑帧在 <code>VideoPresenter::present_until</code>。</p>
     <h3>1. 虚拟媒体时钟</h3>
     <p><code>begin_load_locked</code> 将 <code>state</code> 置为 <code>loading</code>，并把打开交给会话 IO 线程。时钟只在 <code>legato_engine_advance_us</code> 被调用时前进，内部按 16667 微秒的垂直同步量化。<code>NullAudioSink::write_frames</code> 消费 PCM，样本位置经 <code>AudioMasterClock::observe_delay</code> 计算。第一帧在第一次同步呈现，<code>first_frame.us</code> 为 16667，与解码耗时无关。</p>
     <h3>2. 基线</h3>
