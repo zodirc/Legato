@@ -76,6 +76,7 @@ add_library(legato SHARED
   engine/src/engine.cpp
   engine/src/player.cpp
   engine/src/file_playback.cpp
+  engine/src/video_presenter.cpp
   engine/src/media_queue.cpp
   engine/src/clock.cpp
   engine/src/corpus.cpp

@@ -1,16 +1,15 @@
 #include "legato/engine/file_playback.hpp"
 
-#include "legato/engine/clock.hpp"
 #include "legato/engine/media_queue.hpp"
 #include "legato/engine/player.hpp"
 #include "legato/engine/test_hooks.hpp"
+#include "legato/engine/video_presenter.hpp"
 #include "legato/pal/clock.hpp"
-#include "legato/render/sink.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <deque>
+#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -18,9 +17,6 @@
 #include "legato/codec/ffmpeg_sw_decoder.hpp"
 #include "legato/demux/ffmpeg_demuxer.hpp"
 #include "legato/io/file_source.hpp"
-#endif
-#if defined(LEGATO_HAS_ALSA)
-#include "legato/render/alsa_sink.hpp"
 #endif
 
 namespace legato {
@@ -48,34 +44,11 @@ struct FilePlayback::Impl {
     std::unique_ptr<FFmpegDemuxer> demux;
     std::unique_ptr<FFmpegSwDecoder> audio;
     std::unique_ptr<FFmpegSwDecoder> video;
-#if defined(LEGATO_HAS_ALSA)
-    std::unique_ptr<AlsaSink> alsa;
-#else
-    struct AudioOut {
-        int open(int, int) { return -1; }
-        int write_frames(const std::int16_t*, int) { return -1; }
-        void drop() {}
-        void end_interrupt() {}
-        void drain() {}
-        std::int64_t delay_frames() const { return 0; }
-        int rate() const { return 0; }
-        int channels() const { return 0; }
-    };
-    std::unique_ptr<AudioOut> alsa;
-#endif
     int audio_index = -1;
     int video_index = -1;
     int rate = 48000;
     int channels = 2;
-    std::int64_t written_frames = 0;
-    bool saw_frame = false;
-    NullAudioSink null_audio;
-    RecordingVideoSink recording;
     int drop_left = 0;
-    std::int64_t present_elapsed_us = 0;
-    bool saw_present = false;
-    bool present_ended = false;
-    std::deque<VideoFrame> held;
 #endif
     std::unique_ptr<PacketQueue> audio_q;
     std::unique_ptr<PacketQueue> video_q;
@@ -83,12 +56,19 @@ struct FilePlayback::Impl {
     std::unique_ptr<PcmQueue> pcm;
 };
 
-FilePlayback::FilePlayback(Player* player, Clock* clock, bool virtual_clock, bool decode_video, double buffer_start_s,
+FilePlayback::FilePlayback(Player* player, Clock* clock, std::unique_ptr<AudioSink> audio, std::unique_ptr<VideoSink> video,
+                           std::unique_ptr<AudioMasterClock> master, bool decode_video, double buffer_start_s,
                            double buffer_resume_s, double buffer_max_s)
     : player_(player),
       clock_(clock),
+      audio_own_(std::move(audio)),
+      video_own_(std::move(video)),
+      master_own_(std::move(master)),
+      audio_sink_(audio_own_.get()),
+      video_sink_(video_own_.get()),
+      master_(master_own_.get()),
       impl_(std::make_unique<Impl>()),
-      virtual_(virtual_clock),
+      presenter_(std::make_unique<VideoPresenter>()),
       decode_video_(decode_video),
       buffer_start_s_(buffer_start_s > 0 ? buffer_start_s : 1.5),
       buffer_resume_s_(buffer_resume_s > 0 ? buffer_resume_s : buffer_start_s_),
@@ -112,9 +92,10 @@ int FilePlayback::open(const char* path) {
     return -1;
 #else
     impl_->drop_left = test_drop_video_frames();
-    const std::int64_t t0 = clock_ != nullptr ? clock_->now_us() : monotonic_us();
-    auto elapsed = [this, t0]() {
-        const std::int64_t now = clock_ != nullptr ? clock_->now_us() : monotonic_us();
+    const bool paced = clock_ != nullptr && clock_->externally_paced();
+    const std::int64_t t0 = paced ? clock_->now_us() : monotonic_us();
+    auto elapsed = [this, t0, paced]() {
+        const std::int64_t now = paced ? clock_->now_us() : monotonic_us();
         return now - t0;
     };
     impl_->source = std::make_unique<FileSource>(path);
@@ -135,26 +116,33 @@ int FilePlayback::open(const char* path) {
         impl_->audio_index = audio->index;
         impl_->rate = audio->sample_rate > 0 ? audio->sample_rate : 48000;
         impl_->channels = audio->channels > 0 ? audio->channels : 2;
-        if (virtual_) {
-            impl_->null_audio.bind_cancel(&stop_);
-            if (impl_->null_audio.open(impl_->rate, impl_->channels) != 0) {
-                error_name_ = "source_open_failed";
-                error_message_ = "打开被取消";
+        if (audio_sink_ == nullptr) {
+            error_name_ = "audio_device_unavailable";
+            error_message_ = "声卡写入失败";
+            return -1;
+        }
+        audio_sink_->bind_cancel(&stop_);
+        /* 外部时钟始终打开注入的 Sink。本地文件在测试钩子要求软件节拍时不打开设备。 */
+        if (paced || test_pcm_output() == 0) {
+            if (audio_sink_->open(impl_->rate, impl_->channels) != 0) {
+                if (paced) {
+                    error_name_ = "source_open_failed";
+                    error_message_ = "打开被取消";
+                } else {
+                    error_name_ = "audio_device_unavailable";
+                    error_message_ = "声卡写入失败";
+                }
                 return -1;
             }
-        } else if (!test_pcm_output()) {
-#if defined(LEGATO_HAS_ALSA)
-            impl_->alsa = std::make_unique<AlsaSink>();
-#else
-            impl_->alsa = std::make_unique<Impl::AudioOut>();
-#endif
-            if (impl_->alsa->open(impl_->rate, impl_->channels) != 0) {
-                error_name_ = "audio_device_unavailable";
-                error_message_ = "声卡写入失败";
-                return -1;
+            if (audio_sink_->rate() > 0) {
+                impl_->rate = audio_sink_->rate();
             }
-            impl_->rate = impl_->alsa->rate();
-            impl_->channels = impl_->alsa->channels();
+            if (audio_sink_->channels() > 0) {
+                impl_->channels = audio_sink_->channels();
+            }
+            if (!paced) {
+                realtime_audio_ = true;
+            }
         }
         impl_->audio = std::make_unique<FFmpegSwDecoder>(audio->codecpar, audio->time_base_num, audio->time_base_den,
                                                          true, impl_->rate, impl_->channels);
@@ -217,7 +205,8 @@ bool FilePlayback::queues_bottom() const {
     if (impl_->audio && (!impl_->audio_q->empty() || !impl_->pcm->empty())) {
         return false;
     }
-    if (impl_->video && (!impl_->video_q->empty() || !impl_->frames->empty() || !impl_->held.empty())) {
+    if (impl_->video && (!impl_->video_q->empty() || !impl_->frames->empty() ||
+                         (presenter_ != nullptr && presenter_->held_count() > 0))) {
         return false;
     }
     return impl_->audio || impl_->video;
@@ -244,11 +233,13 @@ void FilePlayback::note_bottom() {
     }
     bool expected = false;
     if (stall_latched_.compare_exchange_strong(expected, true)) {
-        player_->note_stall();
+        OutputNote note{};
+        note.kind = OutputNote::Stall;
+        emit_output(note);
     }
 }
 
-void FilePlayback::note_resumed() {
+void FilePlayback::note_resumed(bool via_ring) {
     if (!stall_latched_.load()) {
         return;
     }
@@ -257,7 +248,14 @@ void FilePlayback::note_resumed() {
     }
     stall_latched_.store(false);
     empty_since_us_.store(0);
-    player_->note_buffer_resumed();
+    /* 解复用线程直接回调。输出线程只入环，避免和 Player::mu_ 交叉。 */
+    if (!via_ring) {
+        player_->note_buffer_resumed();
+        return;
+    }
+    OutputNote note{};
+    note.kind = OutputNote::Resume;
+    emit_output(note);
 }
 
 void FilePlayback::launch_threads() {
@@ -276,13 +274,18 @@ void FilePlayback::launch_threads() {
     if (impl_->video) {
         video_thread_ = std::thread([this] { video_main(); });
     }
-    const bool software = virtual_ && test_pcm_output() != 0;
-    if (software || impl_->alsa) {
+    const bool paced = clock_ != nullptr && clock_->externally_paced();
+    const bool software = paced && test_pcm_output() != 0;
+    if (software || realtime_audio_) {
         audio_out_thread_ = std::thread([this, software] { audio_out_main(software); });
     }
     /* 没人取视频帧时，帧队列满会把解复用堵住，音频包也读不出来。 */
-    if (impl_->video && (!virtual_ || software)) {
-        video_drain_thread_ = std::thread([this] { video_drain_main(); });
+    if (impl_->video && (!paced || software)) {
+        video_drain_thread_ = std::thread([this] {
+            if (presenter_ != nullptr) {
+                presenter_->drain_main(this);
+            }
+        });
     }
 #endif
 }
@@ -309,8 +312,8 @@ void FilePlayback::pause() {
     }
     wake();
 #if defined(LEGATO_HAS_FFMPEG)
-    if (impl_->alsa) {
-        impl_->alsa->drop();
+    if (audio_sink_ != nullptr) {
+        audio_sink_->drop();
     }
 #endif
 }
@@ -323,8 +326,9 @@ void FilePlayback::seek(std::int64_t position_us, std::uint32_t serial) {
         seek_req_.store(true);
         at_end_ = false;
     }
-    serial_.store(serial);
-    origin_us_.store(position_us);
+    /* 先发布目标位置，再发布 serial。输出线程见到新 serial 时 origin 已经可见。 */
+    origin_us_.store(position_us, std::memory_order_relaxed);
+    serial_.store(serial, std::memory_order_release);
     demux_eof_.store(false);
     audio_done_serial_.store(0);
     video_done_serial_.store(0);
@@ -337,15 +341,8 @@ void FilePlayback::seek(std::int64_t position_us, std::uint32_t serial) {
     impl_->video_q->set_serial(serial);
     impl_->frames->set_serial(serial);
     impl_->pcm->set_serial(serial);
-    impl_->present_elapsed_us = 0;
-    impl_->saw_present = false;
-    impl_->present_ended = false;
-    impl_->null_audio.reset();
-    impl_->held.clear();
-    impl_->written_frames = 0;
-    impl_->saw_frame = false;
-    if (impl_->alsa) {
-        impl_->alsa->drop();
+    if (audio_sink_ != nullptr) {
+        audio_sink_->drop();
     }
 #endif
     wake();
@@ -367,20 +364,20 @@ bool FilePlayback::apply_seek() {
         serial = seek_serial_;
     }
     if (impl_->demux->seek_us(target) != 0) {
-        player_->media_failed("定位失败");
+        player_->media_failed("seek_failed", "定位失败");
         playing_.store(false);
         return false;
     }
     impl_->demux->flush(serial);
-    serial_.store(serial);
+    origin_us_.store(target, std::memory_order_relaxed);
+    serial_.store(serial, std::memory_order_release);
     impl_->audio_q->set_serial(serial);
     impl_->video_q->set_serial(serial);
     impl_->frames->set_serial(serial);
     impl_->pcm->set_serial(serial);
-    origin_us_.store(target);
     demux_eof_.store(false);
-    if (impl_->alsa) {
-        impl_->alsa->end_interrupt();
+    if (audio_sink_ != nullptr) {
+        audio_sink_->end_interrupt();
     }
     player_->set_media_position(target);
     wake();
@@ -400,8 +397,8 @@ void FilePlayback::stop() {
         impl_->video_q->abort();
         impl_->frames->abort();
         impl_->pcm->abort();
-        if (impl_->alsa) {
-            impl_->alsa->drop();
+        if (audio_sink_ != nullptr) {
+            audio_sink_->drop();
         }
     }
 #endif
@@ -455,12 +452,13 @@ void FilePlayback::demux_main() {
             continue;
         }
         if (rc < 0) {
-            player_->media_failed("读包失败");
+            player_->media_failed("demux_failed", "读包失败");
             playing_.store(false);
             continue;
         }
         if (stages_.first_packet_us == 0) {
-            stages_.first_packet_us = clock_ != nullptr ? clock_->now_us() : 0;
+            const bool paced_now = clock_ != nullptr && clock_->externally_paced();
+            stages_.first_packet_us = paced_now ? clock_->now_us() : 0;
         }
         OwnedPacket packet;
         packet.handle = owned;
@@ -482,7 +480,7 @@ void FilePlayback::demux_main() {
         } else if (!reached_start_.load() && buffered_span_us() >= start_us) {
             reached_start_.store(true);
         }
-        note_resumed();
+        note_resumed(false);
         wake();
     }
 #endif
@@ -513,7 +511,7 @@ void FilePlayback::audio_main() {
                         break;
                     }
                     if (delayed < 0) {
-                        player_->media_failed("音频解码失败");
+                        player_->media_failed("decode_failed", "音频解码失败");
                         break;
                     }
                     if (frame.pcm != nullptr && frame.nb_samples > 0) {
@@ -539,7 +537,7 @@ void FilePlayback::audio_main() {
         }
         if (impl_->audio->decode(packet.data, packet.size, packet.pts_us) < 0) {
             release_packet(&packet);
-            player_->media_failed("音频解码失败");
+            player_->media_failed("decode_failed", "音频解码失败");
             playing_.store(false);
             continue;
         }
@@ -550,11 +548,12 @@ void FilePlayback::audio_main() {
                 break;
             }
             if (got < 0) {
-                player_->media_failed("音频解码失败");
+                player_->media_failed("decode_failed", "音频解码失败");
                 playing_.store(false);
                 break;
             }
-            if (stages_.decoded_us == 0 && clock_ != nullptr) {
+            /* 有视频解码线程时也只由本线程写 decoded_us，避免两路同时写。 */
+            if (stages_.decoded_us == 0 && clock_ != nullptr && clock_->externally_paced()) {
                 stages_.decoded_us = clock_->now_us();
             }
             if (frame.pcm != nullptr && frame.nb_samples > 0 && serial_.load() == serial) {
@@ -613,7 +612,7 @@ void FilePlayback::video_main() {
         }
         if (impl_->video->decode(packet.data, packet.size, packet.pts_us) < 0) {
             release_packet(&packet);
-            player_->media_failed("视频解码失败");
+            player_->media_failed("decode_failed", "视频解码失败");
             playing_.store(false);
             continue;
         }
@@ -624,11 +623,11 @@ void FilePlayback::video_main() {
                 break;
             }
             if (got < 0) {
-                player_->media_failed("视频解码失败");
+                player_->media_failed("decode_failed", "视频解码失败");
                 playing_.store(false);
                 break;
             }
-            if (stages_.decoded_us == 0 && clock_ != nullptr) {
+            if (!has_audio() && stages_.decoded_us == 0 && clock_ != nullptr && clock_->externally_paced()) {
                 stages_.decoded_us = clock_->now_us();
             }
             /* 像素留到下一次 receive 就失效，所以队列里只放 PTS、serial 和指纹。 */
@@ -648,56 +647,6 @@ void FilePlayback::video_main() {
         }
         release_packet(&packet);
         wake();
-    }
-#endif
-}
-
-void FilePlayback::video_drain_main() {
-#if !defined(LEGATO_HAS_FFMPEG)
-    return;
-#else
-    std::int64_t wall_origin = 0;
-    std::int64_t media_origin = 0;
-    while (!stop_.load()) {
-        if (seek_req_.load()) {
-            wall_origin = 0;
-        }
-        VideoFrame frame;
-        if (impl_->frames->pop(&frame) != 0) {
-            const bool video_done = video_done_serial_.load() == serial_.load();
-            if (!virtual_ && impl_->audio == nullptr && demux_eof_.load() && video_done && impl_->frames->empty() &&
-                !seek_req_.load() && playing_.load()) {
-                {
-                    std::lock_guard<std::mutex> lock(wait_mu_);
-                    at_end_ = true;
-                    playing_.store(false);
-                }
-                player_->set_media_position(duration_us_ > 0 ? duration_us_ : origin_us_.load());
-                player_->media_ended();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
-        /* 有音频时只把帧从队列取走，避免帧队列满了堵住解复用。没有音频时按 PTS 对齐单调时钟。 */
-        if (virtual_ || impl_->audio != nullptr || seek_req_.load() || !playing_.load()) {
-            continue;
-        }
-        if (wall_origin == 0) {
-            wall_origin = monotonic_us();
-            media_origin = frame.pts_us;
-        }
-        const std::int64_t due = wall_origin + (frame.pts_us - media_origin);
-        while (!stop_.load() && playing_.load() && !seek_req_.load() && monotonic_us() < due) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        if (stop_.load() || !playing_.load() || seek_req_.load()) {
-            continue;
-        }
-        player_->set_media_position(frame.pts_us);
-        if (!impl_->saw_frame) {
-            impl_->saw_frame = true;
-            player_->media_first_frame(frame.pts_us, monotonic_us() - player_->file_load_mono());
-        }
     }
 #endif
 }
@@ -731,13 +680,22 @@ void FilePlayback::audio_out_main(bool software) {
             }
         }
         if (stall_latched_.load()) {
-            note_resumed();
+            note_resumed(true);
             if (stall_latched_.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
         }
-        const std::uint32_t serial = serial_.load();
+        /* 写入帧数和首帧标记只属于本线程。控制线程发布 serial 之后，在这里清零。 */
+        const std::uint32_t serial = serial_.load(std::memory_order_acquire);
+        if (serial != audio_epoch_) {
+            audio_epoch_ = serial;
+            written_frames_ = 0;
+            saw_audio_ = false;
+            if (master_ != nullptr) {
+                master_->reset(origin_us_.load(std::memory_order_relaxed));
+            }
+        }
         const int got = impl_->pcm->pop(buf.data(), 256, impl_->channels, serial);
         if (got > 0) {
             empty_spins = 0;
@@ -749,25 +707,31 @@ void FilePlayback::audio_out_main(bool software) {
                 }
                 continue;
             }
-            const int wrote = impl_->alsa->write_frames(buf.data(), got);
+            const int wrote = audio_sink_->write_frames(buf.data(), got);
             if (wrote == 0) {
                 continue;
             }
             if (wrote < 0) {
-                player_->media_failed("声卡写入失败");
                 playing_.store(false);
+                OutputNote note{};
+                note.kind = OutputNote::Failed;
+                std::snprintf(note.name, sizeof(note.name), "audio_device_unavailable");
+                std::snprintf(note.message, sizeof(note.message), "声卡写入失败");
+                emit_output(note);
                 continue;
             }
-            impl_->written_frames += got;
-            std::int64_t played = impl_->written_frames - impl_->alsa->delay_frames();
-            if (played < 0) {
-                played = 0;
+            written_frames_ += got;
+            if (master_ != nullptr) {
+                master_->observe_delay(written_frames_, audio_sink_->delay_frames(), impl_->rate);
+                player_->set_media_position(master_->now_us());
             }
-            const std::int64_t position = origin_us_.load() + (impl_->rate > 0 ? played * 1000000 / impl_->rate : 0);
-            player_->set_media_position(position);
-            if (!impl_->saw_frame) {
-                impl_->saw_frame = true;
-                player_->media_first_frame(origin_us_.load(), monotonic_us() - player_->file_load_mono());
+            if (!saw_audio_) {
+                saw_audio_ = true;
+                OutputNote note{};
+                note.kind = OutputNote::FirstFrame;
+                note.position_us = origin_us_.load(std::memory_order_relaxed);
+                note.extra_us = monotonic_us() - player_->file_load_mono();
+                emit_output(note);
             }
             continue;
         }
@@ -776,12 +740,14 @@ void FilePlayback::audio_out_main(bool software) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
-            if (at_end_) {
+            {
                 std::unique_lock<std::mutex> lock(wait_mu_);
-                cv_.wait(lock, [this] { return stop_.load() || seek_req_.load() || !at_end_; });
-                continue;
+                if (at_end_) {
+                    cv_.wait(lock, [this] { return stop_.load() || seek_req_.load() || !at_end_; });
+                    continue;
+                }
             }
-            impl_->alsa->drain();
+            audio_sink_->drain();
             if (stop_.load() || !playing_.load() || seek_req_.load()) {
                 continue;
             }
@@ -790,8 +756,11 @@ void FilePlayback::audio_out_main(bool software) {
                 at_end_ = true;
                 playing_.store(false);
             }
-            player_->set_media_position(duration_us_ > 0 ? duration_us_ : origin_us_.load());
-            player_->media_ended();
+            OutputNote note{};
+            note.kind = OutputNote::Ended;
+            note.position_us = duration_us_ > 0 ? duration_us_ : origin_us_.load();
+            player_->set_media_position(note.position_us);
+            emit_output(note);
             continue;
         }
         note_bottom();
@@ -811,7 +780,7 @@ void FilePlayback::wait_decoded(std::int64_t media_us) {
 #if !defined(LEGATO_HAS_FFMPEG)
     return;
 #else
-    if (!virtual_) {
+    if (clock_ == nullptr || !clock_->externally_paced()) {
         return;
     }
     std::unique_lock<std::mutex> lock(wait_mu_);
@@ -826,142 +795,70 @@ void FilePlayback::present_until(std::int64_t elapsed_us, PresentUpdate* out) {
         return;
     }
     *out = PresentUpdate();
-#if !defined(LEGATO_HAS_FFMPEG)
-    (void)elapsed_us;
-#else
-    if (!virtual_) {
+    if (clock_ == nullptr || !clock_->externally_paced() || presenter_ == nullptr) {
         return;
     }
-    constexpr std::int64_t kVsyncUs = 16667;
-    const std::uint32_t serial = serial_.load();
-    for (auto it = impl_->held.begin(); it != impl_->held.end();) {
-        if (it->serial != serial) {
-            it = impl_->held.erase(it);
-        } else {
-            ++it;
-        }
+    presenter_->present_until(this, elapsed_us, out);
+}
+
+void FilePlayback::emit_output(const OutputNote& note) {
+    if (!notes_.push(note) || player_ == nullptr) {
+        return;
     }
-    auto pull_frames = [this, serial]() {
-        VideoFrame frame;
-        while (impl_->frames->pop(&frame) == 0) {
-            if (frame.serial == serial) {
-                impl_->held.push_back(frame);
-            }
-        }
-    };
-    auto video_ready = [this, serial](std::int64_t limit) {
-        if (impl_->video == nullptr) {
-            return true;
-        }
-        const bool done = video_done_serial_.load() == serial;
-        bool any = false;
-        bool newer = false;
-        for (const VideoFrame& frame : impl_->held) {
-            if (frame.pts_us <= limit) {
-                any = true;
-            } else {
-                newer = true;
-            }
-        }
-        /* 队列只有 8 帧。先把已经解出的帧挪到本线程，解码才能继续，直到出现超过 limit 的帧。 */
-        if (any && (newer || done || decoded_video_us_.load() > limit)) {
-            return true;
-        }
-        if (!any && done && impl_->frames->empty()) {
-            return true;
-        }
-        return false;
-    };
-    auto audio_ready = [this, serial](int need) {
-        if (impl_->audio == nullptr) {
-            return true;
-        }
-        if (audio_done_serial_.load() == serial) {
-            return true;
-        }
-        return impl_->pcm->buffered_frames() >= need;
-    };
-    if (elapsed_us < impl_->present_elapsed_us) {
-        impl_->present_elapsed_us = 0;
-    }
-    while (impl_->present_elapsed_us + kVsyncUs <= elapsed_us) {
-        const int want = impl_->rate > 0 ? static_cast<int>(impl_->rate * kVsyncUs / 1000000) : 0;
-        const std::int64_t limit = origin_us_.load() + impl_->present_elapsed_us + kVsyncUs + kVsyncUs / 2;
-        bool ready = false;
-        for (int spin = 0; spin < 40; ++spin) {
-            pull_frames();
-            note_resumed();
-            if (audio_ready(want) && video_ready(limit)) {
-                ready = true;
-                break;
-            }
-            note_bottom();
-            if (stall_latched_.load() && queues_bottom()) {
-                break;
-            }
-            std::unique_lock<std::mutex> lock(wait_mu_);
-            cv_.wait_for(lock, std::chrono::milliseconds(5), [this] { return stop_.load() || !playing_.load(); });
-            if (stop_.load() || !playing_.load()) {
-                break;
-            }
-        }
-        pull_frames();
-        if (stop_.load() || !playing_.load()) {
-            break;
-        }
-        if (!ready && stall_latched_.load() && queues_bottom()) {
-            break;
-        }
-        if (!ready) {
-            note_bottom();
-            if (stall_latched_.load() && queues_bottom()) {
-                break;
-            }
-        }
-        impl_->present_elapsed_us += kVsyncUs;
-        int left = want;
-        while (left > 0) {
-            const int got = impl_->pcm->pop(nullptr, left, impl_->channels, serial);
-            if (got <= 0) {
-                break;
-            }
-            impl_->null_audio.consume(got);
-            left -= got;
-        }
-        const std::int64_t audio_clock = impl_->rate > 0 ? impl_->null_audio.clock_us() : impl_->present_elapsed_us;
-        int best = -1;
-        for (std::size_t i = 0; i < impl_->held.size(); ++i) {
-            if (impl_->held[i].pts_us <= limit) {
-                best = static_cast<int>(i);
-            } else {
-                break;
-            }
-        }
-        if (impl_->video == nullptr && !impl_->saw_present) {
-            impl_->saw_present = true;
-            out->first = true;
-            out->first_frame_us = impl_->present_elapsed_us;
-        }
-        if (best >= 0) {
-            const VideoFrame chosen = impl_->held[static_cast<std::size_t>(best)];
-            impl_->held.erase(impl_->held.begin(), impl_->held.begin() + best + 1);
-            impl_->recording.record(chosen.pts_us, chosen.content, origin_us_.load(), audio_clock);
-            if (!impl_->saw_present) {
-                impl_->saw_present = true;
-                out->first = true;
-                out->first_frame_us = impl_->present_elapsed_us;
-            }
-        }
-        out->position_us = origin_us_.load() + audio_clock;
-    }
-    out->presented = impl_->recording.presented();
-    out->av_sync_us = impl_->recording.worst_sync_us();
-    impl_->recording.copy_hash(out->sha256, sizeof(out->sha256));
-    if (demux_eof_.load() && duration_us_ > 0 && origin_us_.load() + elapsed_us >= duration_us_ && !impl_->present_ended) {
-        impl_->present_ended = true;
-        out->ended = true;
-        out->position_us = duration_us_;
-    }
+    player_->schedule_note_drain();
+}
+
+bool FilePlayback::pop_note(OutputNote* out) { return out != nullptr && notes_.pop(out); }
+
+bool FilePlayback::notes_pending() const { return notes_.size() != 0; }
+
+void FilePlayback::bind_clock(Clock* clock) { clock_ = clock; }
+
+bool FilePlayback::has_audio() const {
+#if !defined(LEGATO_HAS_FFMPEG)
+    return false;
+#else
+    return impl_ != nullptr && impl_->audio != nullptr;
+#endif
+}
+
+bool FilePlayback::has_video() const {
+#if !defined(LEGATO_HAS_FFMPEG)
+    return false;
+#else
+    return impl_ != nullptr && impl_->video != nullptr;
+#endif
+}
+
+FrameQueue* FilePlayback::frames() {
+#if !defined(LEGATO_HAS_FFMPEG)
+    return nullptr;
+#else
+    return impl_ != nullptr ? impl_->frames.get() : nullptr;
+#endif
+}
+
+PcmQueue* FilePlayback::pcm() {
+#if !defined(LEGATO_HAS_FFMPEG)
+    return nullptr;
+#else
+    return impl_ != nullptr ? impl_->pcm.get() : nullptr;
+#endif
+}
+
+int FilePlayback::sample_rate() const {
+#if !defined(LEGATO_HAS_FFMPEG)
+    return 0;
+#else
+    return impl_ != nullptr ? impl_->rate : 0;
+#endif
+}
+
+int FilePlayback::sample_channels() const {
+#if !defined(LEGATO_HAS_FFMPEG)
+    return 0;
+#else
+    return impl_ != nullptr ? impl_->channels : 0;
 #endif
 }
 

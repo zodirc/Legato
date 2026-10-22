@@ -53,8 +53,9 @@ public:
     void set_media_position(std::int64_t position_us);
     void media_first_frame(std::int64_t position_us, std::int64_t startup_us);
     void media_ended();
-    void media_failed(const char* message);
+    void media_failed(const char* name, const char* message);
     void note_stall();
+    void schedule_note_drain();
     void note_buffer_resumed();
     std::int64_t file_load_mono() const { return file_load_mono_; }
 
@@ -88,7 +89,7 @@ private:
     bool begin_load_locked(const char* uri, std::uint64_t command_id);
     void io_main();
     void finish_open(std::uint64_t generation, std::uint64_t command_id, bool ok);
-    void finish_open_job(const OpenJob& job, std::unique_ptr<FilePlayback> playback, int rc);
+    void finish_open_job(const OpenJob& job, std::shared_ptr<FilePlayback> playback, int rc);
     bool play_locked();
     bool pause_locked();
     bool seek_locked(std::int64_t position_us, int mode);
@@ -98,6 +99,7 @@ private:
     bool same_merge(const EventSlot& slot, int type, const char* json) const;
     void complete_command_locked(std::uint64_t command_id, bool ok);
     void set_error_locked(const char* name, const char* message);
+    void apply_notes();
     void dispatch(bool wake);
     std::uint64_t bump_locked(std::uint64_t* command_id);
     bool ignore_if_released_locked();
@@ -115,7 +117,8 @@ private:
     bool first_frame_sent_ = false;
     bool file_mode_ = false;
     std::int64_t file_load_mono_ = 0;
-    std::unique_ptr<FilePlayback> playback_;
+    std::shared_ptr<FilePlayback> playback_;
+    std::atomic<bool> note_drain_posted_{false};
     std::thread io_;
     std::mutex io_mu_;
     std::condition_variable io_cv_;
