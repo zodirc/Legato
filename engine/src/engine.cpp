@@ -69,6 +69,11 @@ Engine::Engine(const char* config_json) {
     if (json_copy_string(config_json, "mode", mode, sizeof(mode))) {
         headless_ = std::strcmp(mode, "system") != 0;
     }
+    const char* root_begin = nullptr;
+    const char* root_end = nullptr;
+    if (json_find_value(config_json, "corpus_root", &root_begin, &root_end) && root_end > root_begin) {
+        corpus_root_.assign(root_begin, root_end);
+    }
     observe_ = std::thread([this] { observe_main(); });
 }
 

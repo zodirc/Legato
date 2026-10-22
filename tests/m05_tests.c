@@ -7,7 +7,17 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef LEGATO_SOURCE_DIR
+#define LEGATO_SOURCE_DIR "."
+#endif
+
 static int g_failures = 0;
+
+static legato_engine* open_engine(void) {
+    char config[4096];
+    snprintf(config, sizeof(config), "{\"mode\":\"headless\",\"corpus_root\":\"%s\"}", LEGATO_SOURCE_DIR);
+    return legato_engine_create(config);
+}
 
 static void check(int cond, const char* expr, int line) {
     if (!cond) {
@@ -17,6 +27,17 @@ static void check(int cond, const char* expr, int line) {
 }
 
 #define CHECK(cond) check((cond), #cond, __LINE__)
+
+/* 验收是 1 毫秒内返回。TSan 和 ASan 插桩会把同一次调用拉长。
+   打开钩子仍堵 2 秒，所以插桩构建用 20 毫秒仍能证明没有在调用线程上等待。 */
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#    define M05_RETURN_BUDGET_US 20000
+#  endif
+#endif
+#ifndef M05_RETURN_BUDGET_US
+#  define M05_RETURN_BUDGET_US 1000
+#endif
 
 static int64_t now_us(void) {
     struct timespec ts;
@@ -56,7 +77,7 @@ static int wait_commands(legato_player* player, int need) {
 
 static void test_open_does_not_block(void) {
     legato_test_set_open_delay_us(2000000);
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     legato_player* first = legato_player_create(engine, "{\"preset\":\"vod\"}");
     legato_player* second = legato_player_create(engine, "{\"preset\":\"vod\"}");
     CHECK(engine != NULL && first != NULL && second != NULL);
@@ -66,17 +87,17 @@ static void test_open_does_not_block(void) {
     item.uri = "corpus://startup/local-1080p-h264";
     const int64_t load_at = now_us();
     CHECK(legato_player_load(first, &item) == 0);
-    CHECK(now_us() - load_at < 1000);
+    CHECK(now_us() - load_at < M05_RETURN_BUDGET_US);
     const int64_t play_at = now_us();
     CHECK(legato_player_play(second) == 0);
-    CHECK(now_us() - play_at < 1000);
+    CHECK(now_us() - play_at < M05_RETURN_BUDGET_US);
     /* 1.5 秒时打开仍应堵在 Sink 上。钩子失效的话，这里已经能取到 command_done。 */
     const struct timespec mid = {1, 500000000};
     nanosleep(&mid, NULL);
     CHECK(drain_command_done(first) == 0);
     const int64_t release_at = now_us();
     legato_player_release(first);
-    CHECK(now_us() - release_at < 1000);
+    CHECK(now_us() - release_at < M05_RETURN_BUDGET_US);
     const struct timespec rest = {2, 0};
     nanosleep(&rest, NULL);
     legato_player_release(second);
@@ -91,7 +112,7 @@ static const char* trace_of(const char* json) {
 }
 
 static void test_trace_id_per_load(void) {
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     legato_player* player = legato_player_create(engine, "{\"preset\":\"vod\"}");
     legato_media_item item;
     memset(&item, 0, sizeof(item));
@@ -117,7 +138,7 @@ static void test_trace_id_per_load(void) {
 }
 
 static void test_default_seek_mode(void) {
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     legato_player* vod = legato_player_create(engine, "{\"preset\":\"vod\"}");
     CHECK(legato_player_command(vod, "{\"cmd\":\"seek\",\"position_us\":0}") != 0);
     CHECK(wait_commands(vod, 1) == 1);
@@ -133,17 +154,31 @@ static void test_default_seek_mode(void) {
 
 static void test_music_skips_video_decoder(void) {
     legato_test_reset_video_decoder_opens();
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_test_reset_video_packets();
+    legato_engine* engine = open_engine();
     legato_player* player = legato_player_create(engine, "{\"preset\":\"music\"}");
     legato_media_item item;
     memset(&item, 0, sizeof(item));
     item.struct_size = (uint32_t)sizeof(item);
     item.uri = "corpus://startup/local-1080p-h264";
     CHECK(legato_player_load(player, &item) == 0);
-    CHECK(wait_commands(player, 1) == 1);
+    CHECK(legato_player_play(player) == 0);
+    CHECK(wait_commands(player, 2) == 2);
+    CHECK(legato_engine_advance_us(engine, 500000) == 0);
     CHECK(legato_test_video_decoder_opens() == 0);
+    CHECK(legato_test_video_packets() == 0);
     legato_player_release(player);
-    const struct timespec settle = {1, 0};
+    const struct timespec settle = {0, 200000000};
+    nanosleep(&settle, NULL);
+
+    legato_test_reset_video_packets();
+    legato_player* vod = legato_player_create(engine, "{\"preset\":\"vod\"}");
+    CHECK(legato_player_load(vod, &item) == 0);
+    CHECK(legato_player_play(vod) == 0);
+    CHECK(wait_commands(vod, 2) == 2);
+    CHECK(legato_engine_advance_us(engine, 200000) == 0);
+    CHECK(legato_test_video_packets() > 0);
+    legato_player_release(vod);
     nanosleep(&settle, NULL);
     legato_engine_destroy(engine);
 }
@@ -159,7 +194,7 @@ static int saw_ended(legato_player* player) {
 }
 
 static void test_seek_does_not_drop_ended(void) {
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     legato_player* player = legato_player_create(engine, "{\"preset\":\"vod\"}");
     legato_media_item item;
     memset(&item, 0, sizeof(item));
@@ -230,7 +265,7 @@ static int delay_applied(void) { return legato_test_decode_delay_applied() != 0;
 static void test_decode_delay_no_xrun(void) {
     legato_test_set_hold_demux(0);
     legato_test_set_pcm_output(1);
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     legato_player* player = legato_player_create(engine, "{\"preset\":\"realtime\"}");
     CHECK(engine != NULL && player != NULL);
     legato_media_item item;
@@ -259,7 +294,7 @@ static void test_decode_delay_no_xrun(void) {
 static void test_queue_bottom_counts_stall(void) {
     legato_test_set_pcm_output(0);
     legato_test_set_hold_demux(0);
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     legato_player* player = legato_player_create(engine, "{\"preset\":\"realtime\"}");
     CHECK(engine != NULL && player != NULL);
     legato_media_item item;
@@ -290,7 +325,27 @@ static void test_queue_bottom_counts_stall(void) {
     legato_engine_destroy(engine);
 }
 
+static void test_missing_corpus_root(void) {
+    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_player* player = legato_player_create(engine, "{\"preset\":\"vod\"}");
+    CHECK(engine != NULL && player != NULL);
+    legato_media_item item;
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.uri = "corpus://startup/local-1080p-h264";
+    CHECK(legato_player_load(player, &item) == 0);
+    CHECK(wait_commands(player, 1) == 1);
+    char* error = NULL;
+    CHECK(legato_player_get(player, "last_error", &error) == 0);
+    CHECK(error != NULL && strstr(error, "corpus 根目录未设置") != NULL);
+    CHECK(error != NULL && strstr(error, "source_open_failed") != NULL);
+    legato_free(error);
+    legato_player_release(player);
+    legato_engine_destroy(engine);
+}
+
 int main(void) {
+    test_missing_corpus_root();
     test_open_does_not_block();
     test_trace_id_per_load();
     test_default_seek_mode();

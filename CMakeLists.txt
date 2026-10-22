@@ -113,7 +113,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 target_include_directories(legato PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(legato PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/src)
-target_compile_definitions(legato PRIVATE LEGATO_BUILDING LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(legato PRIVATE LEGATO_BUILDING)
 if(MSVC)
   target_compile_options(legato PRIVATE /W4)
 else()
@@ -141,10 +141,12 @@ target_compile_options(legato-bench PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato-bench PRIVATE legato)
 
 add_executable(legato_hello examples/hello.c)
+target_compile_definitions(legato_hello PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(legato_hello PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato_hello PRIVATE legato)
 
 add_executable(legato_smoke tests/smoke.c)
+target_compile_definitions(legato_smoke PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(legato_smoke PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato_smoke PRIVATE legato)
 
@@ -162,6 +164,7 @@ add_test(NAME core COMMAND legato_core_tests)
 add_test(NAME parse COMMAND legato_parse_tests)
 add_test(NAME smoke COMMAND legato_smoke)
 add_executable(legato_m05_tests tests/m05_tests.c)
+target_compile_definitions(legato_m05_tests PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(legato_m05_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato_m05_tests PRIVATE legato)
 add_test(NAME m05 COMMAND legato_m05_tests)
@@ -180,10 +183,12 @@ add_test(NAME t1_drop_frame
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(t1_drop_frame PROPERTIES
   ENVIRONMENT "LEGATO_TEST_DROP_VIDEO_FRAMES=1"
-  WILL_FAIL TRUE)
+  WILL_FAIL TRUE
+  TIMEOUT 120)
 add_test(NAME t1_feed
   COMMAND legato-bench run bench/scenarios/feed-swipe-4g.yaml --golden bench/golden/feed-swipe-4g.json
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(t1_startup t1_feed PROPERTIES TIMEOUT 120)
 add_test(NAME python_abi
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/bindings/python/legato.py $<TARGET_FILE:legato>)
 if(LEGATO_HAS_FFMPEG)

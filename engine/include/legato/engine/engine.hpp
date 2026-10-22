@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -40,6 +41,8 @@ public:
     /* 在调用线程上停掉观测、回收和控制线程。不能在回收线程上调用，否则 join 自己会终止进程。 */
     void shutdown();
     bool headless() const { return headless_; }
+    /* 确定性回归的清单根目录。来自创建参数 corpus_root，不编进动态库。 */
+    const std::string& corpus_root() const { return corpus_root_; }
     VirtualClock& virtual_clock() { return virtual_clock_; }
     void warmup();
     int advance_us(std::int64_t delta_us);
@@ -67,6 +70,7 @@ private:
     std::vector<std::weak_ptr<Player>> players_;
     bool headless_ = true;
     bool warmed_ = false;
+    std::string corpus_root_;
     SourceRegistration sources_[4]{};
 };
 

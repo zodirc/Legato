@@ -7,8 +7,14 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef LEGATO_SOURCE_DIR
+#define LEGATO_SOURCE_DIR "."
+#endif
+
 int main(void) {
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    char config[4096];
+    snprintf(config, sizeof(config), "{\"mode\":\"headless\",\"corpus_root\":\"%s\"}", LEGATO_SOURCE_DIR);
+    legato_engine* engine = legato_engine_create(config);
     legato_player* player = legato_player_create(engine, NULL);
     legato_media_item item;
     memset(&item, 0, sizeof(item));

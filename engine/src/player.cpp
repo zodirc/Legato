@@ -23,10 +23,6 @@
 #include <string>
 #include <utility>
 
-#ifndef LEGATO_SOURCE_DIR
-#define LEGATO_SOURCE_DIR "."
-#endif
-
 namespace legato {
 namespace {
 
@@ -242,7 +238,15 @@ bool Player::begin_load_locked(const char* uri, std::uint64_t command_id) {
     if (std::strncmp(uri, "corpus:", 7) == 0) {
         const char* err_name = nullptr;
         const char* err_message = nullptr;
-        if (resolve_corpus(LEGATO_SOURCE_DIR, uri, path, static_cast<int>(sizeof(path)), &err_name, &err_message) != 0) {
+        /* 根目录由调用方在创建引擎时传入。编进动态库就会把构建机路径带进交付件。 */
+        const std::string& corpus_root = engine_->corpus_root();
+        if (corpus_root.empty()) {
+            set_error_locked("source_open_failed", "corpus 根目录未设置");
+            complete_command_locked(command_id, false);
+            return true;
+        }
+        if (resolve_corpus(corpus_root.c_str(), uri, path, static_cast<int>(sizeof(path)), &err_name, &err_message) !=
+            0) {
             set_error_locked(err_name != nullptr ? err_name : "source_open_failed",
                              err_message != nullptr ? err_message : "打不开这个文件");
             complete_command_locked(command_id, false);
