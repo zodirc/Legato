@@ -320,10 +320,26 @@ struct Session {
     }
 };
 
+std::string json_escape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char ch : text) {
+        if (ch == '\\' || ch == '"') {
+            out.push_back('\\');
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
+
 void run_once(const Scenario& scenario, Measured* measured, bool record) {
     Session session;
-    char config[] = "{\"mode\":\"headless\"}";
-    session.engine = legato_engine_create(config);
+#ifndef LEGATO_SOURCE_DIR
+#define LEGATO_SOURCE_DIR "."
+#endif
+    const std::string config = std::string("{\"mode\":\"headless\",\"corpus_root\":\"") +
+                               json_escape(LEGATO_SOURCE_DIR) + "\"}";
+    session.engine = legato_engine_create(config.c_str());
     if (session.engine == nullptr) {
         throw std::runtime_error("engine_create failed");
     }

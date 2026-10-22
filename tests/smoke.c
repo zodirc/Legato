@@ -6,7 +6,17 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef LEGATO_SOURCE_DIR
+#define LEGATO_SOURCE_DIR "."
+#endif
+
 static int g_failures = 0;
+
+static legato_engine* open_engine(void) {
+    char config[4096];
+    snprintf(config, sizeof(config), "{\"mode\":\"headless\",\"corpus_root\":\"%s\"}", LEGATO_SOURCE_DIR);
+    return legato_engine_create(config);
+}
 
 static void check(int cond, const char* expr, int line) {
     if (!cond) {
@@ -63,7 +73,7 @@ int main(void) {
 
     CHECK(legato_player_create(NULL, "{\"preset\":\"nope\"}") == NULL);
 
-    legato_engine* engine = legato_engine_create("{\"mode\":\"headless\"}");
+    legato_engine* engine = open_engine();
     CHECK(engine != NULL);
     legato_warmup(engine);
 
