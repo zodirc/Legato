@@ -9,9 +9,84 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config python3 curl xz-utils libasound2-dev libx264-dev
+      - name: cache play-demo ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg/dist
+          key: ffmpeg-5.1.6-play-demo-${{ hashFiles('third_party/ffmpeg/configs/play-demo.config', 'third_party/ffmpeg/patches/**', 'third_party/ffmpeg/build-ffmpeg.sh') }}
+      - name: cache host encoder
+        uses: actions/cache@v4
+        with:
+          path: third_party/host
+          key: ffmpeg-5.1.6-host-encode-${{ hashFiles('third_party/ffmpeg/configs/host-encode.config', 'third_party/ffmpeg/build-ffmpeg.sh') }}
+      - name: ffmpeg and corpus
+        run: bash tools/ci_prepare_t1.sh
       - name: configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: build
         run: cmake --build build -j
+      # play_tone 需要 ALSA PCM 设备。没有设备时打开失败是 G6，不在这个作业里改成通过。
       - name: test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -E play_tone
+
+  tsan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config python3 curl xz-utils libasound2-dev libx264-dev
+      - name: cache play-demo ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg/dist
+          key: ffmpeg-5.1.6-play-demo-${{ hashFiles('third_party/ffmpeg/configs/play-demo.config', 'third_party/ffmpeg/patches/**', 'third_party/ffmpeg/build-ffmpeg.sh') }}
+      - name: cache host encoder
+        uses: actions/cache@v4
+        with:
+          path: third_party/host
+          key: ffmpeg-5.1.6-host-encode-${{ hashFiles('third_party/ffmpeg/configs/host-encode.config', 'third_party/ffmpeg/build-ffmpeg.sh') }}
+      - name: ffmpeg and corpus
+        run: bash tools/ci_prepare_t1.sh
+      - name: configure
+        run: >
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
+      - name: build
+        run: cmake --build build-tsan -j
+      - name: test
+        run: ctest --test-dir build-tsan --output-on-failure -R '^(m05|t1_startup)$'
+
+  asan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config python3 curl xz-utils libasound2-dev libx264-dev
+      - name: cache play-demo ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg/dist
+          key: ffmpeg-5.1.6-play-demo-${{ hashFiles('third_party/ffmpeg/configs/play-demo.config', 'third_party/ffmpeg/patches/**', 'third_party/ffmpeg/build-ffmpeg.sh') }}
+      - name: cache host encoder
+        uses: actions/cache@v4
+        with:
+          path: third_party/host
+          key: ffmpeg-5.1.6-host-encode-${{ hashFiles('third_party/ffmpeg/configs/host-encode.config', 'third_party/ffmpeg/build-ffmpeg.sh') }}
+      - name: ffmpeg and corpus
+        run: bash tools/ci_prepare_t1.sh
+      - name: configure
+        run: >
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address"
+      - name: build
+        run: cmake --build build-asan -j
+      - name: test
+        run: ctest --test-dir build-asan --output-on-failure -R '^(m05|t1_startup)$'
