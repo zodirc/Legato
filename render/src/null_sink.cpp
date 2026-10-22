@@ -32,8 +32,9 @@ void NullAudioSink::bind_cancel(const std::atomic<bool>* cancel) { cancel_ = can
 
 /* 验收把这次打开拉长。阻塞留在 Sink 上，调用线程上的 load 和 release 仍然立即返回。
    取消后返回失败，避免回收已经开始后还继续建解码器。 */
-int NullAudioSink::open(int sample_rate, int /*channels*/) {
+int NullAudioSink::open(int sample_rate, int channels) {
     rate_ = sample_rate > 0 ? sample_rate : 48000;
+    channels_ = channels > 0 ? channels : 2;
     consumed_ = 0;
     std::int64_t left = test_open_delay_us();
     while (left > 0) {
@@ -53,6 +54,21 @@ int NullAudioSink::open(int sample_rate, int /*channels*/) {
 void NullAudioSink::present(std::int64_t /*pts_us*/) {}
 
 void NullAudioSink::close() {}
+
+int NullAudioSink::write_frames(const std::int16_t* /*interleaved*/, int frames) {
+    if (frames > 0) {
+        consumed_ += frames;
+    }
+    return frames > 0 ? frames : 0;
+}
+
+void NullAudioSink::drop() {}
+
+void NullAudioSink::drain() {}
+
+void NullAudioSink::end_interrupt() {}
+
+int NullAudioSink::delay_frames() const { return 0; }
 
 void NullAudioSink::reset() { consumed_ = 0; }
 
@@ -82,6 +98,10 @@ RecordingVideoSink::RecordingVideoSink() : state_(std::make_unique<State>()) {}
 RecordingVideoSink::~RecordingVideoSink() = default;
 
 void RecordingVideoSink::present(std::int64_t pts_us) { record(pts_us, 0, 0, 0); }
+
+void RecordingVideoSink::present_sample(const VideoPresent& sample) {
+    record(sample.pts_us, sample.content, sample.origin_us, sample.audio_clock_us);
+}
 
 void RecordingVideoSink::record(std::int64_t pts_us, std::uint64_t content, std::int64_t origin_us,
                                 std::int64_t audio_clock_us) {
