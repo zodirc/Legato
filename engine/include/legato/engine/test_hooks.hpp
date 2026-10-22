@@ -13,6 +13,9 @@ int test_last_seek_mode();
 void note_test_video_decoder();
 int test_video_decoder_opens();
 void reset_test_video_decoder_opens();
+void note_test_video_packet();
+int test_video_packets();
+void reset_test_video_packets();
 
 /* 验收用。PCM 输出线程在虚拟会话里也跑，用来看解码延迟会不会造成设备欠载。 */
 void set_test_pcm_output(int enable);

@@ -9,6 +9,7 @@ namespace {
 std::atomic<std::int64_t> g_open_delay_us{0};
 std::atomic<int> g_last_seek_mode{-1};
 std::atomic<int> g_video_decoder_opens{0};
+std::atomic<int> g_video_packets{0};
 std::atomic<int> g_pcm_output{0};
 std::atomic<std::int64_t> g_decode_delay_us{0};
 std::atomic<int> g_decode_delay_started{0};
@@ -44,6 +45,12 @@ void note_test_video_decoder() { g_video_decoder_opens.fetch_add(1, std::memory_
 int test_video_decoder_opens() { return g_video_decoder_opens.load(std::memory_order_acquire); }
 
 void reset_test_video_decoder_opens() { g_video_decoder_opens.store(0, std::memory_order_release); }
+
+void note_test_video_packet() { g_video_packets.fetch_add(1, std::memory_order_relaxed); }
+
+int test_video_packets() { return g_video_packets.load(std::memory_order_acquire); }
+
+void reset_test_video_packets() { g_video_packets.store(0, std::memory_order_release); }
 
 void set_test_pcm_output(int enable) {
     g_pcm_pops.store(0, std::memory_order_release);

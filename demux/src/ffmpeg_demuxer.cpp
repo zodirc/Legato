@@ -139,25 +139,41 @@ int FFmpegDemuxer::open() {
     return packet_ != nullptr ? 0 : -1;
 }
 
+void FFmpegDemuxer::discard_video() {
+    AVFormatContext* fmt = static_cast<AVFormatContext*>(fmt_);
+    if (fmt == nullptr || video_.index < 0) {
+        return;
+    }
+    fmt->streams[video_.index]->discard = AVDISCARD_ALL;
+}
+
 int FFmpegDemuxer::read_packet(PacketView* out) {
     if (out == nullptr || fmt_ == nullptr || packet_ == nullptr) {
         return -1;
     }
     AVPacket* packet = static_cast<AVPacket*>(packet_);
-    av_packet_unref(packet);
-    const int err = av_read_frame(static_cast<AVFormatContext*>(fmt_), packet);
-    if (err == AVERROR_EOF) {
-        return 1;
-    }
-    if (err < 0) {
-        return -1;
-    }
     AVFormatContext* fmt = static_cast<AVFormatContext*>(fmt_);
-    if (packet->stream_index < 0 || static_cast<unsigned>(packet->stream_index) >= fmt->nb_streams) {
+    AVStream* stream = nullptr;
+    for (;;) {
         av_packet_unref(packet);
-        return -1;
+        const int err = av_read_frame(fmt, packet);
+        if (err == AVERROR_EOF) {
+            return 1;
+        }
+        if (err < 0) {
+            return -1;
+        }
+        if (packet->stream_index < 0 || static_cast<unsigned>(packet->stream_index) >= fmt->nb_streams) {
+            av_packet_unref(packet);
+            return -1;
+        }
+        stream = fmt->streams[packet->stream_index];
+        /* discard_video 把不要的轨标成丢弃。这里跳过，调用方看不到视频包。 */
+        if (stream->discard == AVDISCARD_ALL) {
+            continue;
+        }
+        break;
     }
-    AVStream* stream = fmt->streams[packet->stream_index];
     out->data = packet->data;
     out->size = packet->size;
     out->pts_us = packet->pts == AV_NOPTS_VALUE

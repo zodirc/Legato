@@ -36,6 +36,8 @@ public:
     std::int64_t duration_us() const { return duration_us_; }
     const Stream* audio() const { return audio_.index >= 0 ? &audio_ : nullptr; }
     const Stream* video() const { return video_.index >= 0 ? &video_ : nullptr; }
+    /* 预设不要视频时调用。之后 read_packet 不再交出这一轨。 */
+    void discard_video();
 
 private:
     DataSource* source_ = nullptr;
