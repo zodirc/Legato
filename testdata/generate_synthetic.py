@@ -52,6 +52,7 @@ def corpus_command(ffmpeg, output, duration, width, height, rate, mark):
     video = "testsrc2=size=%dx%d:rate=%d:duration=%d" % (width, height, rate, duration)
     audio = "sine=frequency=1000:sample_rate=48000:duration=%d" % duration
     video_filter = "drawbox=x=%d:y=0:w=40:h=40:color=white:t=fill" % (mark * 8)
+    # -fflags 放在输出侧。写在输入前面只作用于 lavfi，封装仍会写入 Lavf 版本和创建时间。
     return [
         ffmpeg,
         "-y",
@@ -66,6 +67,8 @@ def corpus_command(ffmpeg, output, duration, width, height, rate, mark):
         "-vf",
         video_filter,
         "-shortest",
+        "-fflags",
+        "+bitexact",
         "-c:v",
         "libx264",
         "-preset",
@@ -76,10 +79,26 @@ def corpus_command(ffmpeg, output, duration, width, height, rate, mark):
         "30",
         "-keyint_min",
         "30",
+        "-threads",
+        "1",
+        "-flags:v",
+        "+bitexact",
         "-c:a",
         "aac",
+        "-flags:a",
+        "+bitexact",
         output,
     ]
+
+
+def corpus_commands_reproducible(ffmpeg):
+    required = ("-threads 1", "-fflags +bitexact", "-flags:v +bitexact", "-flags:a +bitexact")
+    for name, width, height, duration, mark in t1_tasks():
+        text = shlex.join(corpus_command(ffmpeg, name, duration, width, height, 30, mark))
+        for part in required:
+            if part not in text:
+                return part
+    return ""
 
 
 def sha256_file(path):
@@ -242,11 +261,19 @@ def main(argv):
     parser.add_argument("--corpus", action="store_true")
     parser.add_argument("--write-catalog", action="store_true")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--check-command", action="store_true")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--ffmpeg", default="")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if args.check_command:
+        missing = corpus_commands_reproducible("ffmpeg")
+        if missing:
+            sys.stderr.write("corpus command missing %s\n" % missing)
+            return 1
+        print("corpus commands pin threads and bitexact", flush=True)
+        return 0
     if args.check:
         return check_corpus(root)
     if args.corpus:

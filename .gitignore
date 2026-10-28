@@ -17,6 +17,9 @@ __pycache__/
 .idea/
 .vscode/
 testdata/out/
+testdata/corpus-*.tar
+third_party/x264/src/
+third_party/curl-7.61.1/
 *.mp4
 *.mkv
 *.wav

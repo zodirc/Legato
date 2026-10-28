@@ -35,6 +35,12 @@ if [[ ! -f "$cfg" ]]; then
 fi
 
 mapfile -t flags < <(grep -v '^#' "$cfg" | grep -v '^[[:space:]]*$')
+if [[ -n "${LEGATO_FFMPEG_EXTRA_CFLAGS:-}" ]]; then
+  flags+=("--extra-cflags=${LEGATO_FFMPEG_EXTRA_CFLAGS}")
+fi
+if [[ -n "${LEGATO_FFMPEG_EXTRA_LDFLAGS:-}" ]]; then
+  flags+=("--extra-ldflags=${LEGATO_FFMPEG_EXTRA_LDFLAGS}")
+fi
 shopt -s nullglob
 patches=("$root"/patches/*.patch)
 if [[ ${#patches[@]} -gt 0 ]]; then
