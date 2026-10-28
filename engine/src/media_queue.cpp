@@ -1,6 +1,10 @@
 #include "legato/engine/media_queue.hpp"
 
+#include "legato/core/alloc.hpp"
+#include "legato/engine/test_hooks.hpp"
+
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 namespace legato {
@@ -30,35 +34,48 @@ PacketQueue::~PacketQueue() {
 }
 
 void PacketQueue::clear_locked() {
-    for (OwnedPacket& packet : packets_) {
-        release_packet(&packet);
+    for (int i = 0; i < count_; ++i) {
+        OwnedPacket* packet = order_[(head_ + i) % kSlotCount];
+        release_packet(packet);
+        pool_.release(packet);
     }
-    packets_.clear();
+    head_ = 0;
+    count_ = 0;
     bytes_ = 0;
     span_us_ = 0;
 }
 
 bool PacketQueue::over_limit_locked() const {
-    if (packets_.empty()) {
+    if (count_ == 0) {
         return false;
     }
     return span_us_ >= max_span_us_ || bytes_ >= max_bytes_;
 }
 
+const OwnedPacket& PacketQueue::front_locked() const { return *order_[head_]; }
+
+const OwnedPacket& PacketQueue::back_locked() const {
+    return *order_[(head_ + count_ - 1) % kSlotCount];
+}
+
 int PacketQueue::put(OwnedPacket packet) {
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait(lock, [this, &packet] {
-        return abort_ || packet.serial != serial_ || !over_limit_locked();
+        return abort_ || packet.serial != serial_ || (!over_limit_locked() && count_ < kSlotCount);
     });
     if (abort_ || packet.serial != serial_) {
         return -1;
     }
+    OwnedPacket* slot = pool_.acquire();
+    if (slot == nullptr) {
+        return -1;
+    }
     bytes_ += packet.size > 0 ? packet.size : 0;
-    if (packets_.empty()) {
+    if (count_ == 0) {
         span_us_ = packet.duration_us > 0 ? packet.duration_us : 0;
     } else {
-        const std::int64_t newest = std::max(packets_.back().pts_us, packet.pts_us);
-        const std::int64_t oldest = std::min(packets_.front().pts_us, packet.pts_us);
+        const std::int64_t newest = std::max(back_locked().pts_us, packet.pts_us);
+        const std::int64_t oldest = std::min(front_locked().pts_us, packet.pts_us);
         std::int64_t span = newest - oldest;
         if (span < 0) {
             span = 0;
@@ -68,7 +85,9 @@ int PacketQueue::put(OwnedPacket packet) {
         }
         span_us_ = span;
     }
-    packets_.push_back(packet);
+    *slot = packet;
+    order_[(head_ + count_) % kSlotCount] = slot;
+    ++count_;
     cv_.notify_all();
     return 0;
 }
@@ -78,25 +97,29 @@ int PacketQueue::get(OwnedPacket* out, std::uint32_t serial) {
         return -1;
     }
     std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait(lock, [this, serial] { return abort_ || serial_ != serial || eof_ || !packets_.empty(); });
+    cv_.wait(lock, [this, serial] { return abort_ || serial_ != serial || eof_ || count_ > 0; });
     if (abort_ || serial_ != serial) {
         return -1;
     }
-    if (packets_.empty()) {
+    if (count_ == 0) {
         return 1;
     }
-    *out = packets_.front();
-    packets_.pop_front();
+    OwnedPacket* slot = order_[head_];
+    *out = *slot;
+    *slot = OwnedPacket{};
+    pool_.release(slot);
+    head_ = (head_ + 1) % kSlotCount;
+    --count_;
     bytes_ -= out->size > 0 ? out->size : 0;
     if (bytes_ < 0) {
         bytes_ = 0;
     }
-    if (packets_.empty()) {
+    if (count_ == 0) {
         span_us_ = 0;
-    } else if (packets_.size() == 1) {
-        span_us_ = packets_.front().duration_us > 0 ? packets_.front().duration_us : 0;
+    } else if (count_ == 1) {
+        span_us_ = front_locked().duration_us > 0 ? front_locked().duration_us : 0;
     } else {
-        std::int64_t span = packets_.back().pts_us - packets_.front().pts_us;
+        std::int64_t span = back_locked().pts_us - front_locked().pts_us;
         if (span < 0) {
             span = 0;
         }
@@ -128,12 +151,29 @@ void PacketQueue::abort() {
 
 bool PacketQueue::empty() const {
     std::lock_guard<std::mutex> lock(mu_);
-    return packets_.empty();
+    return count_ == 0;
 }
 
 std::int64_t PacketQueue::span_us() const {
     std::lock_guard<std::mutex> lock(mu_);
     return span_us_;
+}
+
+FrameQueue::FrameQueue() = default;
+
+FrameQueue::~FrameQueue() {
+    std::lock_guard<std::mutex> lock(mu_);
+    clear_locked();
+}
+
+void FrameQueue::clear_locked() {
+    for (int i = 0; i < count_; ++i) {
+        VideoFrame* slot = order_[(head_ + i) % kCapacity];
+        release_frame(slot);
+        pool_.release(slot);
+    }
+    head_ = 0;
+    count_ = 0;
 }
 
 int FrameQueue::push(VideoFrame frame) {
@@ -142,8 +182,12 @@ int FrameQueue::push(VideoFrame frame) {
     if (abort_ || frame.serial != serial_) {
         return -1;
     }
-    const int tail = (head_ + count_) % kCapacity;
-    frames_[tail] = frame;
+    VideoFrame* slot = pool_.acquire();
+    if (slot == nullptr) {
+        return -1;
+    }
+    *slot = frame;
+    order_[(head_ + count_) % kCapacity] = slot;
     ++count_;
     cv_.notify_all();
     return 0;
@@ -157,7 +201,10 @@ int FrameQueue::pop(VideoFrame* out) {
     if (count_ == 0) {
         return -1;
     }
-    *out = frames_[head_];
+    VideoFrame* slot = order_[head_];
+    *out = *slot;
+    *slot = VideoFrame{};
+    pool_.release(slot);
     head_ = (head_ + 1) % kCapacity;
     --count_;
     cv_.notify_all();
@@ -167,14 +214,14 @@ int FrameQueue::pop(VideoFrame* out) {
 void FrameQueue::set_serial(std::uint32_t serial) {
     std::lock_guard<std::mutex> lock(mu_);
     serial_ = serial;
-    head_ = 0;
-    count_ = 0;
+    clear_locked();
     cv_.notify_all();
 }
 
 void FrameQueue::abort() {
     std::lock_guard<std::mutex> lock(mu_);
     abort_ = true;
+    clear_locked();
     cv_.notify_all();
 }
 
@@ -188,9 +235,15 @@ int FrameQueue::size() const {
     return count_;
 }
 
+PcmQueue::PcmQueue() { samples_.assign(static_cast<std::size_t>(kMaxFrames) * kMaxChannels, 0); }
+
 int PcmQueue::push(const std::int16_t* interleaved, int frames, int channels, std::uint32_t serial) {
-    if (interleaved == nullptr || frames <= 0 || channels <= 0) {
+    if (interleaved == nullptr || frames <= 0 || channels <= 0 || channels > kMaxChannels) {
         return 0;
+    }
+    if (in_steady_state() && test_pcm_steady_alloc_once()) {
+        void* block = std::malloc(16);
+        std::free(block);
     }
     int offset = 0;
     while (offset < frames) {
@@ -199,17 +252,29 @@ int PcmQueue::push(const std::int16_t* interleaved, int frames, int channels, st
         if (abort_ || serial != serial_) {
             return -1;
         }
+        if (channels_ == 0) {
+            channels_ = channels;
+        }
+        if (channels != channels_) {
+            return -1;
+        }
         const int room = kMaxFrames - buffered_frames_;
         const int take = std::min(frames - offset, room);
-        Chunk chunk;
-        chunk.serial = serial;
-        chunk.channels = channels;
-        chunk.frames = take;
-        chunk.samples.assign(interleaved + static_cast<std::size_t>(offset) * static_cast<std::size_t>(channels),
-                             interleaved + static_cast<std::size_t>(offset + take) * static_cast<std::size_t>(channels));
+        const std::size_t width = static_cast<std::size_t>(channels_);
+        int left = take;
+        int src_off = offset;
+        int dst = (read_ + buffered_frames_) % kMaxFrames;
+        while (left > 0) {
+            const int run = std::min(left, kMaxFrames - dst);
+            std::copy(interleaved + static_cast<std::size_t>(src_off) * width,
+                      interleaved + static_cast<std::size_t>(src_off + run) * width,
+                      samples_.data() + static_cast<std::size_t>(dst) * width);
+            left -= run;
+            src_off += run;
+            dst = (dst + run) % kMaxFrames;
+        }
         buffered_frames_ += take;
         offset += take;
-        chunks_.push_back(std::move(chunk));
         cv_.notify_all();
     }
     return 0;
@@ -220,28 +285,32 @@ int PcmQueue::pop(std::int16_t* dst, int max_frames, int channels, std::uint32_t
         return 0;
     }
     std::lock_guard<std::mutex> lock(mu_);
-    while (!chunks_.empty() && chunks_.front().serial != serial) {
-        buffered_frames_ -= chunks_.front().frames;
-        chunks_.pop_front();
-    }
-    if (buffered_frames_ < 0) {
+    if (serial != serial_) {
+        read_ = 0;
         buffered_frames_ = 0;
-    }
-    if (chunks_.empty()) {
         return 0;
     }
-    Chunk& chunk = chunks_.front();
-    const int have = chunk.frames - chunk.used;
-    const int take = std::min(max_frames, have);
-    if (dst != nullptr && chunk.channels == channels) {
-        const std::int16_t* src = chunk.samples.data() + static_cast<std::size_t>(chunk.used) * static_cast<std::size_t>(channels);
-        std::copy(src, src + static_cast<std::size_t>(take) * static_cast<std::size_t>(channels), dst);
+    if (buffered_frames_ == 0 || channels_ == 0 || channels != channels_) {
+        return 0;
     }
-    chunk.used += take;
+    const int take = std::min(max_frames, buffered_frames_);
+    const std::size_t width = static_cast<std::size_t>(channels_);
+    int left = take;
+    int src = read_;
+    int dst_off = 0;
+    while (left > 0) {
+        const int run = std::min(left, kMaxFrames - src);
+        if (dst != nullptr) {
+            std::copy(samples_.data() + static_cast<std::size_t>(src) * width,
+                      samples_.data() + static_cast<std::size_t>(src + run) * width,
+                      dst + static_cast<std::size_t>(dst_off) * width);
+        }
+        left -= run;
+        src = (src + run) % kMaxFrames;
+        dst_off += run;
+    }
+    read_ = src;
     buffered_frames_ -= take;
-    if (chunk.used >= chunk.frames) {
-        chunks_.pop_front();
-    }
     cv_.notify_all();
     return take;
 }
@@ -249,8 +318,9 @@ int PcmQueue::pop(std::int16_t* dst, int max_frames, int channels, std::uint32_t
 void PcmQueue::set_serial(std::uint32_t serial) {
     std::lock_guard<std::mutex> lock(mu_);
     serial_ = serial;
-    chunks_.clear();
+    read_ = 0;
     buffered_frames_ = 0;
+    channels_ = 0;
     cv_.notify_all();
 }
 
@@ -262,7 +332,7 @@ void PcmQueue::abort() {
 
 bool PcmQueue::empty() const {
     std::lock_guard<std::mutex> lock(mu_);
-    return chunks_.empty();
+    return buffered_frames_ == 0;
 }
 
 int PcmQueue::buffered_frames() const {

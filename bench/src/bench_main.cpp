@@ -35,29 +35,6 @@ void write_file(const std::string& path, const std::string& contents) {
     output << contents;
 }
 
-std::string git_commit() {
-#ifdef LEGATO_SOURCE_DIR
-    const std::string command =
-        std::string("git -C \"") + LEGATO_SOURCE_DIR + "\" rev-parse --short=12 HEAD 2>/dev/null";
-    FILE* pipe = popen(command.c_str(), "r");
-    if (pipe == nullptr) {
-        return "unknown";
-    }
-    char buf[64];
-    std::string out;
-    while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
-        out += buf;
-    }
-    pclose(pipe);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
-        out.pop_back();
-    }
-    return out.empty() ? "unknown" : out;
-#else
-    return "unknown";
-#endif
-}
-
 std::int64_t parse_duration_us(const std::string& text) {
     if (text.size() >= 2 && text.compare(text.size() - 2, 2, "ms") == 0) {
         return std::llround(std::stod(text.substr(0, text.size() - 2)) * 1000.0);
@@ -83,12 +60,13 @@ std::int64_t percentile(std::vector<std::int64_t> samples, double p) {
     return samples[static_cast<size_t>(rank - 1)];
 }
 
-enum class StepKind { Load, Play, Pause, Stop, WaitFirstFrame, Watch, SwipeNext, Seek };
+enum class StepKind { Load, Play, Pause, Stop, WaitFirstFrame, Watch, SwipeNext, Seek, SeekBurst };
 
 struct Step {
     StepKind kind = StepKind::Load;
     std::int64_t watch_us = 0;
     std::int64_t position_us = 0;
+    int burst = 1;
 };
 
 struct Action {
@@ -106,6 +84,8 @@ struct Scenario {
     std::string network_trace;
     int repetitions = 1;
     int warmup = 0;
+    std::int64_t seek_tolerance_us = -1;
+    int max_seek_commits = -1;
     std::vector<std::string> metrics;
     std::vector<Action> actions;
 };
@@ -145,6 +125,13 @@ Step parse_step(const legato::bench::YamlNode& node) {
         step.position_us = parse_duration_us(seek->scalar);
         return step;
     }
+    const legato::bench::YamlNode* burst = node.find("seek_burst");
+    if (burst != nullptr && burst->kind == legato::bench::YamlNode::Map) {
+        step.kind = StepKind::SeekBurst;
+        step.burst = std::stoi(burst->get("count", "1"));
+        step.position_us = parse_duration_us(burst->get("to", "0s"));
+        return step;
+    }
     throw std::runtime_error("unsupported action map");
 }
 
@@ -174,6 +161,8 @@ Scenario parse_scenario(const legato::bench::YamlNode& root) {
     const std::string warmup = root.get("warmup", "0");
     scenario.repetitions = std::stoi(repetitions);
     scenario.warmup = std::stoi(warmup);
+    scenario.seek_tolerance_us = std::stoll(root.get("seek_tolerance_us", "-1"));
+    scenario.max_seek_commits = std::stoi(root.get("max_seek_commits", "-1"));
     if (const legato::bench::YamlNode* metrics = root.find("metrics")) {
         if (metrics->kind != legato::bench::YamlNode::Seq) {
             throw std::runtime_error("metrics must be a list");
@@ -225,7 +214,11 @@ struct Measured {
     int reused = 0;
     std::uint64_t alloc_steady = 0;
     std::int64_t av_sync_us = 0;
+    std::vector<std::int64_t> av_sync_ms;
     std::string presentation_sha256;
+    std::int64_t seek_error_us = -1;
+    int seek_stale_frames = 0;
+    int seek_commits = 0;
     Breakdown breakdown;
     bool have_breakdown = false;
     int runs = 0;
@@ -297,6 +290,22 @@ std::string playlist_uri(const std::string& playlist, int index) {
     return prefix + "/" + std::to_string(index);
 }
 
+void append_sync(legato_player* player, Measured* measured) {
+    const int count = legato_player_copy_av_sync_us(player, nullptr, 0);
+    if (count <= 0 || measured == nullptr) {
+        return;
+    }
+    std::vector<std::int64_t> raw(static_cast<std::size_t>(count));
+    legato_player_copy_av_sync_us(player, raw.data(), count);
+    for (std::int64_t sample : raw) {
+        const std::int64_t ms = sample / 1000;
+        measured->av_sync_ms.push_back(ms);
+        if (sample > measured->av_sync_us) {
+            measured->av_sync_us = sample;
+        }
+    }
+}
+
 void post_load(legato_player* player, const std::string& uri) {
     legato_media_item item;
     std::memset(&item, 0, sizeof(item));
@@ -363,6 +372,7 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
     }
 
     bool failed = false;
+    std::int64_t pending_seek_us = -1;
     for (const Action& action : scenario.actions) {
         for (int n = 0; n < action.repeat; ++n) {
             for (const Step& step : action.steps) {
@@ -388,6 +398,45 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
                         throw std::runtime_error("seek failed");
                     }
                     wait_commands(player, &measured->events, record, 1);
+                    pending_seek_us = step.position_us;
+                } else if (step.kind == StepKind::SeekBurst) {
+                    /* 连续 Seek 合成一次执行，command_done 仍按次发出。环只有 32 格，多出来的会计入 events_dropped。 */
+                    legato_session_stats before;
+                    std::memset(&before, 0, sizeof(before));
+                    before.struct_size = static_cast<uint32_t>(sizeof(before));
+                    if (legato_player_read_stats(player, &before) != 0) {
+                        throw std::runtime_error("seek failed");
+                    }
+                    for (int i = 0; i < step.burst; ++i) {
+                        if (legato_player_seek(player, step.position_us, LEGATO_SEEK_MODE_PRECISE) != 0) {
+                            throw std::runtime_error("seek failed");
+                        }
+                    }
+                    int got = 0;
+                    bool finished = false;
+                    for (int spin = 0; spin < 20000; ++spin) {
+                        const int seen = got;
+                        drain(player, &measured->events, record, &got);
+                        legato_session_stats now;
+                        std::memset(&now, 0, sizeof(now));
+                        now.struct_size = static_cast<uint32_t>(sizeof(now));
+                        if (legato_player_read_stats(player, &now) != 0) {
+                            throw std::runtime_error("seek failed");
+                        }
+                        const int dropped = now.events_dropped - before.events_dropped;
+                        if (got + (dropped > 0 ? dropped : 0) >= step.burst) {
+                            finished = true;
+                            break;
+                        }
+                        if (got == seen) {
+                            const timespec pause = {0, 2000000};
+                            nanosleep(&pause, nullptr);
+                        }
+                    }
+                    if (!finished) {
+                        throw std::runtime_error("command did not finish");
+                    }
+                    pending_seek_us = step.position_us;
                 } else if (step.kind == StepKind::WaitFirstFrame) {
                     if (!wait_first_frame(engine, player, &measured->events, record)) {
                         failed = true;
@@ -419,9 +468,32 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
                         break;
                     }
                     drain(player, &measured->events, record, nullptr);
+                    if (record && pending_seek_us >= 0 && scenario.seek_tolerance_us >= 0) {
+                        legato_session_stats seek_stats;
+                        std::memset(&seek_stats, 0, sizeof(seek_stats));
+                        seek_stats.struct_size = static_cast<uint32_t>(sizeof(seek_stats));
+                        if (legato_player_read_stats(player, &seek_stats) != 0 || seek_stats.seek_first_pts_us < 0) {
+                            throw std::runtime_error("seek did not present a frame");
+                        }
+                        const std::int64_t error = seek_stats.seek_first_pts_us >= pending_seek_us
+                                                       ? seek_stats.seek_first_pts_us - pending_seek_us
+                                                       : pending_seek_us - seek_stats.seek_first_pts_us;
+                        if (error > scenario.seek_tolerance_us) {
+                            throw std::runtime_error("seek first pts is outside one frame");
+                        }
+                        if (error > measured->seek_error_us) {
+                            measured->seek_error_us = error;
+                        }
+                        measured->seek_stale_frames = seek_stats.seek_stale_frames;
+                        measured->seek_commits = seek_stats.seek_commits;
+                        pending_seek_us = -1;
+                    }
                 } else if (step.kind == StepKind::SwipeNext) {
                     if (scenario.count > 0 && index + 1 >= scenario.count) {
                         continue;
+                    }
+                    if (record) {
+                        append_sync(player, measured);
                     }
                     ++index;
                     current = playlist_uri(scenario.playlist, index);
@@ -440,6 +512,17 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
             break;
         }
     }
+    if (record && scenario.seek_tolerance_us >= 0) {
+        if (measured->seek_error_us < 0) {
+            throw std::runtime_error("seek accuracy was not measured");
+        }
+        if (measured->seek_stale_frames != 0) {
+            throw std::runtime_error("old serial frame was presented");
+        }
+        if (scenario.max_seek_commits >= 0 && measured->seek_commits > scenario.max_seek_commits) {
+            throw std::runtime_error("consecutive seeks were not coalesced");
+        }
+    }
 
     legato_session_stats stats;
     std::memset(&stats, 0, sizeof(stats));
@@ -451,7 +534,7 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
         if (stats.alloc_steady > measured->alloc_steady) {
             measured->alloc_steady = stats.alloc_steady;
         }
-        measured->av_sync_us = stats.av_sync_us;
+        append_sync(player, measured);
         measured->presentation_sha256 = stats.presentation_sha256;
         measured->runs += 1;
     }
@@ -462,15 +545,52 @@ void run_once(const Scenario& scenario, Measured* measured, bool record) {
 
 bool metric_known(const std::string& name) {
     return name == "first_frame_ms" || name == "stall_ratio" || name == "alloc_steady" || name == "av_sync_ms" ||
-           name == "decoder_reuse_rate" || name == "first_frame_breakdown";
+           name == "decoder_reuse_rate" || name == "first_frame_breakdown" || name == "seek_error_us" ||
+           name == "seek_stale_frames" || name == "seek_commits";
 }
 
 std::string json_bool(bool value) { return value ? "true" : "false"; }
 
+std::string json_us(std::int64_t value) {
+    if (value < 0) {
+        return "null";
+    }
+    return std::to_string(value);
+}
+
+#ifndef LEGATO_BUILD_CONFIG
+#define LEGATO_BUILD_CONFIG "play-demo"
+#endif
+#ifndef LEGATO_FFMPEG_VERSION
+#define LEGATO_FFMPEG_VERSION "5.1.6"
+#endif
+
+std::string blank_commit(std::string text) {
+    const std::string key = "\"commit\": \"";
+    const std::size_t pos = text.find(key);
+    if (pos == std::string::npos) {
+        return text;
+    }
+    const std::size_t start = pos + key.size();
+    const std::size_t end = text.find('"', start);
+    if (end == std::string::npos) {
+        return text;
+    }
+    text.replace(start, end - start, "COMMIT");
+    return text;
+}
+
 std::string format_result(const Scenario& scenario, const Measured& measured, const std::string& scenario_hash,
                           const std::string& commit) {
     const bool alloc_ok = measured.alloc_steady == 0;
-    const std::int64_t av_p95 = percentile({measured.av_sync_us / 1000}, 0.95);
+    const std::int64_t av_p50 = percentile(measured.av_sync_ms, 0.50);
+    const std::int64_t av_p95 = percentile(measured.av_sync_ms, 0.95);
+    std::int64_t av_max = 0;
+    for (std::int64_t sample : measured.av_sync_ms) {
+        if (sample > av_max) {
+            av_max = sample;
+        }
+    }
     const bool av_ok = av_p95 < 40;
     const double reuse = measured.presented == 0
                              ? 0.0
@@ -483,8 +603,8 @@ std::string format_result(const Scenario& scenario, const Measured& measured, co
     std::string out;
     out += "{\n";
     out += "  \"scenario\": {\"id\": \"" + scenario.id + "\", \"hash\": \"sha256:" + scenario_hash + "\"},\n";
-    out += "  \"build\": {\"commit\": \"" + commit +
-           "\", \"config\": \"skeleton\", \"ffmpeg\": \"none\", \"quirks_db\": \"none\"},\n";
+    out += "  \"build\": {\"commit\": \"" + commit + "\", \"config\": \"" LEGATO_BUILD_CONFIG
+           "\", \"ffmpeg\": \"" LEGATO_FFMPEG_VERSION "\", \"quirks_db\": \"none\"},\n";
     out += "  \"env\": {\"tier\": \"" + scenario.tier +
            "\", \"device\": \"headless\", \"os\": \"linux\", \"backend\": \"legato\", "
            "\"model\": \"pipeline\", \"preset\": \"" +
@@ -511,15 +631,22 @@ std::string format_result(const Scenario& scenario, const Measured& measured, co
         } else if (name == "alloc_steady") {
             out += "{\"unit\": \"count\", \"value\": " + std::to_string(measured.alloc_steady) + "}";
         } else if (name == "av_sync_ms") {
-            out += "{\"unit\": \"ms\", \"p95\": " + std::to_string(av_p95) + "}";
+            out += "{\"unit\": \"ms\", \"p50\": " + std::to_string(av_p50) + ", \"p95\": " + std::to_string(av_p95) +
+                   ", \"max\": " + std::to_string(av_max) + "}";
+        } else if (name == "seek_error_us") {
+            out += "{\"unit\": \"us\", \"value\": " + std::to_string(measured.seek_error_us) + "}";
+        } else if (name == "seek_stale_frames") {
+            out += "{\"unit\": \"count\", \"value\": " + std::to_string(measured.seek_stale_frames) + "}";
+        } else if (name == "seek_commits") {
+            out += "{\"unit\": \"count\", \"value\": " + std::to_string(measured.seek_commits) + "}";
         } else if (name == "decoder_reuse_rate") {
             out += std::string("{\"unit\": \"ratio\", \"value\": ") + reuse_buf + "}";
         } else if (name == "first_frame_breakdown") {
-            out += "{\"unit\": \"us\", \"probe\": " + std::to_string(measured.breakdown.probe) +
-                   ", \"first_packet\": " + std::to_string(measured.breakdown.first_packet) +
-                   ", \"decoder_open\": " + std::to_string(measured.breakdown.decoder_open) +
-                   ", \"first_frame_decoded\": " + std::to_string(measured.breakdown.decoded) +
-                   ", \"first_frame_presented\": " + std::to_string(measured.breakdown.presented) +
+            out += "{\"unit\": \"us\", \"probe\": " + json_us(measured.breakdown.probe) +
+                   ", \"first_packet\": " + json_us(measured.breakdown.first_packet) +
+                   ", \"decoder_open\": " + json_us(measured.breakdown.decoder_open) +
+                   ", \"first_frame_decoded\": " + json_us(measured.breakdown.decoded) +
+                   ", \"first_frame_presented\": " + json_us(measured.breakdown.presented) +
                    ", \"cache_hit\": " + json_bool(measured.breakdown.cache_hit) +
                    ", \"decoder_reused\": " + json_bool(measured.breakdown.decoder_reused) + "}";
         }
@@ -592,27 +719,31 @@ int main(int argc, char** argv) {
             run_once(scenario, &measured, true);
         }
         const std::string hash = legato::bench::sha256_hex(text);
-        const std::string real = format_result(scenario, measured, hash, git_commit());
-        const std::string comparable = format_result(scenario, measured, hash, "GIT");
+#ifdef LEGATO_BUILD_COMMIT
+        const std::string commit = LEGATO_BUILD_COMMIT;
+#else
+        const std::string commit = "unknown";
+#endif
+        const std::string real = format_result(scenario, measured, hash, commit);
         if (!out_path.empty()) {
             write_file(out_path, real);
         }
         if (!write_golden_path.empty()) {
-            write_file(write_golden_path, comparable);
+            write_file(write_golden_path, real);
         }
         std::fputs(real.c_str(), stdout);
         const bool alloc_ok = measured.alloc_steady == 0;
-        const bool av_ok = percentile({measured.av_sync_us / 1000}, 0.95) < 40;
+        const bool av_ok = percentile(measured.av_sync_ms, 0.95) < 40;
         if (!alloc_ok || !av_ok) {
-            std::fprintf(stderr, "T1 gate failed: alloc_steady=%llu av_sync_us=%lld\n",
+            std::fprintf(stderr, "T1 gate failed: alloc_steady=%llu av_sync_p95_ms=%lld\n",
                          static_cast<unsigned long long>(measured.alloc_steady),
-                         static_cast<long long>(measured.av_sync_us));
+                         static_cast<long long>(percentile(measured.av_sync_ms, 0.95)));
             return 1;
         }
         if (!golden_path.empty()) {
             const std::string expected = read_file(golden_path);
-            if (expected != comparable) {
-                show_mismatch(comparable, expected);
+            if (blank_commit(expected) != blank_commit(real)) {
+                show_mismatch(blank_commit(real), blank_commit(expected));
                 return 1;
             }
         }

@@ -18,6 +18,9 @@ struct FrameView {
     std::uint32_t serial = 0;
     bool audio = false;
     bool hardware = false;
+    /* 视频帧的 av_frame_ref。调用方持有，下一次 receive 不会改这份像素。 */
+    void* retain = nullptr;
+    void (*release_retain)(void*) = nullptr;
 };
 
 class Decoder {

@@ -1,5 +1,7 @@
 #include "legato/codec/ffmpeg_sw_decoder.hpp"
 
+#include "legato/core/alloc.hpp"
+
 #include <cstdlib>
 #include <cstring>
 
@@ -12,6 +14,13 @@ extern "C" {
 
 namespace legato {
 namespace {
+
+void release_av_frame(void* handle) {
+    /* 归还 AVFrame 时 FFmpeg 的缓冲池仍可能分配。这是 receive 里那份引用的配对释放。 */
+    AllocExempt exempt;
+    auto* frame = static_cast<AVFrame*>(handle);
+    av_frame_free(&frame);
+}
 
 std::int64_t to_us(std::int64_t pts, AVRational time_base) {
     if (pts == AV_NOPTS_VALUE) {
@@ -101,6 +110,7 @@ int FFmpegSwDecoder::open() {
 }
 
 int FFmpegSwDecoder::decode(const std::uint8_t* data, int size, std::int64_t pts_us) {
+    AllocExempt exempt;
     AVCodecContext* codec = static_cast<AVCodecContext*>(codec_);
     if (codec == nullptr) {
         return -1;
@@ -121,6 +131,7 @@ int FFmpegSwDecoder::decode(const std::uint8_t* data, int size, std::int64_t pts
 }
 
 int FFmpegSwDecoder::receive(FrameView* out) {
+    AllocExempt exempt;
     if (out == nullptr || frame_ == nullptr || codec_ == nullptr) {
         return -1;
     }
@@ -145,9 +156,16 @@ int FFmpegSwDecoder::receive(FrameView* out) {
     out->sample_rate = out_rate_;
     out->channels = out_channels_;
     if (!audio_) {
-        /* 像素留到下一次 receive。调用方必须在那之前读完 data0。 */
-        out->data0 = frame->data[0];
-        out->linesize0 = frame->linesize[0];
+        /* 交给队列的是另一份引用。解码器下一次 receive 可以复用自己的 AVFrame。 */
+        AVFrame* copy = av_frame_alloc();
+        if (copy == nullptr || av_frame_ref(copy, frame) < 0) {
+            av_frame_free(&copy);
+            return -1;
+        }
+        out->data0 = copy->data[0];
+        out->linesize0 = copy->linesize[0];
+        out->retain = copy;
+        out->release_retain = release_av_frame;
         return 0;
     }
     const int out_samples = swr_get_out_samples(static_cast<SwrContext*>(swr_), frame->nb_samples);
@@ -182,6 +200,7 @@ int FFmpegSwDecoder::receive(FrameView* out) {
 }
 
 int FFmpegSwDecoder::pull_delayed(FrameView* out) {
+    AllocExempt exempt;
     if (!audio_ || swr_ == nullptr || out == nullptr || out_rate_ <= 0 || out_channels_ <= 0) {
         return 1;
     }
@@ -222,6 +241,7 @@ int FFmpegSwDecoder::pull_delayed(FrameView* out) {
 }
 
 void FFmpegSwDecoder::flush(std::uint32_t serial) {
+    AllocExempt exempt;
     serial_ = serial;
     sample_origin_ = 0;
     if (codec_ != nullptr) {

@@ -5,6 +5,7 @@
 #include "legato/engine/test_hooks.hpp"
 #include "legato/engine/video_presenter.hpp"
 #include "legato/pal/clock.hpp"
+#include "legato/legato_idl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include "legato/codec/ffmpeg_sw_decoder.hpp"
 #include "legato/demux/ffmpeg_demuxer.hpp"
 #include "legato/io/file_source.hpp"
+#include "legato/io/data_source.hpp"
 #endif
 
 namespace legato {
@@ -40,7 +42,7 @@ void release_packet(OwnedPacket* packet) {
 
 struct FilePlayback::Impl {
 #if defined(LEGATO_HAS_FFMPEG)
-    std::unique_ptr<FileSource> source;
+    std::unique_ptr<DataSource> source;
     std::unique_ptr<FFmpegDemuxer> demux;
     std::unique_ptr<FFmpegSwDecoder> audio;
     std::unique_ptr<FFmpegSwDecoder> video;
@@ -58,7 +60,7 @@ struct FilePlayback::Impl {
 
 FilePlayback::FilePlayback(Player* player, Clock* clock, std::unique_ptr<AudioSink> audio, std::unique_ptr<VideoSink> video,
                            std::unique_ptr<AudioMasterClock> master, bool decode_video, double buffer_start_s,
-                           double buffer_resume_s, double buffer_max_s)
+                           double buffer_resume_s, double buffer_max_s, bool allow_audio_fallback)
     : player_(player),
       clock_(clock),
       audio_own_(std::move(audio)),
@@ -70,6 +72,7 @@ FilePlayback::FilePlayback(Player* player, Clock* clock, std::unique_ptr<AudioSi
       impl_(std::make_unique<Impl>()),
       presenter_(std::make_unique<VideoPresenter>()),
       decode_video_(decode_video),
+      allow_audio_fallback_(allow_audio_fallback),
       buffer_start_s_(buffer_start_s > 0 ? buffer_start_s : 1.5),
       buffer_resume_s_(buffer_resume_s > 0 ? buffer_resume_s : buffer_start_s_),
       buffer_max_s_(buffer_max_s > 0 ? buffer_max_s : 50) {
@@ -91,6 +94,18 @@ int FilePlayback::open(const char* path) {
     error_message_ = "打不开这个文件";
     return -1;
 #else
+    auto source = std::make_unique<FileSource>(path);
+    return open_source(std::move(source));
+#endif
+}
+
+int FilePlayback::open_source(std::unique_ptr<DataSource> source) {
+#if !defined(LEGATO_HAS_FFMPEG)
+    (void)source;
+    error_name_ = "source_open_failed";
+    error_message_ = "打不开这个文件";
+    return -1;
+#else
     impl_->drop_left = test_drop_video_frames();
     const bool paced = clock_ != nullptr && clock_->externally_paced();
     const std::int64_t t0 = paced ? clock_->now_us() : monotonic_us();
@@ -98,11 +113,24 @@ int FilePlayback::open(const char* path) {
         const std::int64_t now = paced ? clock_->now_us() : monotonic_us();
         return now - t0;
     };
-    impl_->source = std::make_unique<FileSource>(path);
-    if (impl_->source->open_file() != 0) {
+    if (source == nullptr) {
         error_name_ = "source_open_failed";
         error_message_ = "打不开这个文件";
         return -1;
+    }
+    impl_->source = std::move(source);
+    if (impl_->source->open_io() != 0) {
+        error_name_ = "source_open_failed";
+        error_message_ = "打不开这个文件";
+        return -1;
+    }
+    session_seekable_ = impl_->source->session_seekable();
+    if (impl_->source->has_net_timing()) {
+        const DataSource::NetTiming timing = impl_->source->net_timing();
+        stages_.dns_us = timing.dns_us;
+        stages_.connect_us = timing.connect_us;
+        stages_.tls_us = timing.tls_us;
+        stages_.first_byte_us = timing.first_byte_us;
     }
     impl_->demux = std::make_unique<FFmpegDemuxer>(impl_->source.get());
     if (impl_->demux->open() != 0) {
@@ -128,17 +156,32 @@ int FilePlayback::open(const char* path) {
                 if (paced) {
                     error_name_ = "source_open_failed";
                     error_message_ = "打开被取消";
-                } else {
+                    return -1;
+                }
+                /* music 和 realtime 不回落。其余预设改绑单调时钟，输出线程按样本时长走到流结束。 */
+                if (!allow_audio_fallback_) {
                     error_name_ = "audio_device_unavailable";
                     error_message_ = "声卡写入失败";
+                    return -1;
                 }
-                return -1;
-            }
-            if (audio_sink_->rate() > 0) {
-                impl_->rate = audio_sink_->rate();
-            }
-            if (audio_sink_->channels() > 0) {
-                impl_->channels = audio_sink_->channels();
+                audio_own_ = std::make_unique<FallbackAudioSink>();
+                audio_sink_ = audio_own_.get();
+                audio_sink_->bind_cancel(&stop_);
+                if (audio_sink_->open(impl_->rate, impl_->channels) != 0) {
+                    error_name_ = "audio_device_unavailable";
+                    error_message_ = "声卡写入失败";
+                    return -1;
+                }
+                master_ = nullptr;
+                bind_clock(&monotonic_);
+                audio_fallback_ = true;
+            } else {
+                if (audio_sink_->rate() > 0) {
+                    impl_->rate = audio_sink_->rate();
+                }
+                if (audio_sink_->channels() > 0) {
+                    impl_->channels = audio_sink_->channels();
+                }
             }
             if (!paced) {
                 realtime_audio_ = true;
@@ -181,7 +224,26 @@ int FilePlayback::open(const char* path) {
 #endif
 }
 
-void FilePlayback::wake() { cv_.notify_all(); }
+void FilePlayback::wake() {
+    wait_gen_.fetch_add(1, std::memory_order_relaxed);
+    cv_.notify_all();
+}
+
+void FilePlayback::publish_audio_media_us(std::int64_t media_us) {
+    audio_media_us_.store(media_us, std::memory_order_release);
+    /* 取帧线程在等这个位置。不唤醒的话，它会停到下一次解复用。 */
+    wake();
+}
+
+void FilePlayback::note_video_dropped() { video_dropped_.fetch_add(1, std::memory_order_release); }
+
+int FilePlayback::render_gl(unsigned fbo, int width, int height) {
+    auto* sink = dynamic_cast<GlVideoSink*>(video_sink_);
+    if (sink == nullptr) {
+        return -1;
+    }
+    return sink->draw(fbo, width, height);
+}
 
 std::int64_t FilePlayback::buffered_span_us() const {
 #if !defined(LEGATO_HAS_FFMPEG)
@@ -323,15 +385,24 @@ void FilePlayback::pause() {
 }
 
 void FilePlayback::seek(std::int64_t position_us, std::uint32_t serial) {
+    seek_to(position_us, serial, LEGATO_SEEK_MODE_PRECISE);
+}
+
+void FilePlayback::seek_to(std::int64_t position_us, std::uint32_t serial, int mode) {
     {
         std::lock_guard<std::mutex> lock(wait_mu_);
         seek_to_ = position_us;
         seek_serial_ = serial;
+        seek_mode_ = mode;
         seek_req_.store(true);
         at_end_ = false;
     }
+    /* 目标先于 demux 可见。连续 Seek 只改这里，解复用线程看到更新的 serial 就放弃上一次。 */
+    drop_before_us_.store(mode == LEGATO_SEEK_MODE_PRECISE ? position_us : -1, std::memory_order_release);
+    seek_first_pts_.store(-1, std::memory_order_release);
     /* 先发布目标位置，再发布 serial。输出线程见到新 serial 时 origin 已经可见。 */
     origin_us_.store(position_us, std::memory_order_relaxed);
+    audio_media_us_.store(position_us, std::memory_order_release);
     serial_.store(serial, std::memory_order_release);
     demux_eof_.store(false);
     audio_done_serial_.store(0);
@@ -356,37 +427,56 @@ bool FilePlayback::apply_seek() {
 #if !defined(LEGATO_HAS_FFMPEG)
     return false;
 #else
-    std::int64_t target = 0;
-    std::uint32_t serial = 1;
-    {
-        std::lock_guard<std::mutex> lock(wait_mu_);
-        if (!seek_req_.load()) {
+    for (;;) {
+        std::int64_t target = 0;
+        std::uint32_t serial = 1;
+        int mode = LEGATO_SEEK_MODE_PRECISE;
+        {
+            std::lock_guard<std::mutex> lock(wait_mu_);
+            if (!seek_req_.load()) {
+                return false;
+            }
+            seek_req_.store(false);
+            target = seek_to_;
+            serial = seek_serial_;
+            mode = seek_mode_;
+        }
+        if (impl_->demux->seek_us(target) != 0) {
+            player_->media_failed("seek_failed", "定位失败");
+            playing_.store(false);
             return false;
         }
-        seek_req_.store(false);
-        target = seek_to_;
-        serial = seek_serial_;
+        {
+            std::lock_guard<std::mutex> lock(wait_mu_);
+            /* av_seek_frame 期间控制线程可能已经改了目标。这一次不 flush，接着定位到最新位置。 */
+            if (seek_req_.load() && seek_serial_ != serial) {
+                continue;
+            }
+        }
+        impl_->demux->flush(serial);
+        origin_us_.store(target, std::memory_order_relaxed);
+        drop_before_us_.store(mode == LEGATO_SEEK_MODE_PRECISE ? target : -1, std::memory_order_release);
+        seek_first_pts_.store(-1, std::memory_order_release);
+        demux_eof_.store(false);
+        if (audio_sink_ != nullptr) {
+            audio_sink_->end_interrupt();
+        }
+        player_->set_media_position(target);
+        seek_commits_.fetch_add(1, std::memory_order_release);
+        wake();
+        return true;
     }
-    if (impl_->demux->seek_us(target) != 0) {
-        player_->media_failed("seek_failed", "定位失败");
-        playing_.store(false);
+#endif
+}
+
+bool FilePlayback::note_video_present(std::int64_t pts_us, std::uint32_t frame_serial) {
+    if (frame_serial != serial_.load(std::memory_order_acquire)) {
+        seek_stale_.fetch_add(1, std::memory_order_release);
         return false;
     }
-    impl_->demux->flush(serial);
-    origin_us_.store(target, std::memory_order_relaxed);
-    serial_.store(serial, std::memory_order_release);
-    impl_->audio_q->set_serial(serial);
-    impl_->video_q->set_serial(serial);
-    impl_->frames->set_serial(serial);
-    impl_->pcm->set_serial(serial);
-    demux_eof_.store(false);
-    if (audio_sink_ != nullptr) {
-        audio_sink_->end_interrupt();
-    }
-    player_->set_media_position(target);
-    wake();
+    std::int64_t empty = -1;
+    seek_first_pts_.compare_exchange_strong(empty, pts_us, std::memory_order_release, std::memory_order_relaxed);
     return true;
-#endif
 }
 
 void FilePlayback::stop() {
@@ -431,6 +521,7 @@ void FilePlayback::demux_main() {
 #else
     const std::int64_t start_us = seconds_us(buffer_start_s_);
     while (!stop_.load()) {
+        note_thread_wake();
         if (seek_req_.load()) {
             apply_seek();
             continue;
@@ -500,6 +591,12 @@ void FilePlayback::audio_main() {
 #else
     std::uint32_t flushed = 0;
     while (!stop_.load()) {
+        note_thread_wake();
+        if (!playing_.load() && !seek_req_.load()) {
+            std::unique_lock<std::mutex> lock(wait_mu_);
+            cv_.wait(lock, [this] { return stop_.load() || playing_.load() || seek_req_.load(); });
+            continue;
+        }
         const std::uint32_t serial = serial_.load();
         if (flushed != serial && impl_->audio) {
             impl_->audio->flush(serial);
@@ -522,7 +619,9 @@ void FilePlayback::audio_main() {
                         player_->media_failed("decode_failed", "音频解码失败");
                         break;
                     }
-                    if (frame.pcm != nullptr && frame.nb_samples > 0) {
+                    const std::int64_t drop_before = drop_before_us_.load(std::memory_order_acquire);
+                    if (frame.pcm != nullptr && frame.nb_samples > 0 &&
+                        (drop_before < 0 || frame.pts_us >= drop_before)) {
                         impl_->pcm->push(frame.pcm, frame.nb_samples, impl_->channels, serial);
                     }
                 }
@@ -564,7 +663,9 @@ void FilePlayback::audio_main() {
             if (stages_.decoded_us == 0 && clock_ != nullptr && clock_->externally_paced()) {
                 stages_.decoded_us = clock_->now_us();
             }
-            if (frame.pcm != nullptr && frame.nb_samples > 0 && serial_.load() == serial) {
+            const std::int64_t drop_before = drop_before_us_.load(std::memory_order_acquire);
+            if (frame.pcm != nullptr && frame.nb_samples > 0 && serial_.load() == serial &&
+                (drop_before < 0 || frame.pts_us >= drop_before)) {
                 impl_->pcm->push(frame.pcm, frame.nb_samples, impl_->channels, serial);
             }
         }
@@ -578,23 +679,14 @@ void FilePlayback::video_main() {
 #if !defined(LEGATO_HAS_FFMPEG)
     return;
 #else
-    auto hash_plane = [](const FrameView& frame) {
-        std::uint64_t hash = 14695981039346656037ull;
-        if (frame.data0 == nullptr || frame.height <= 0 || frame.linesize0 <= 0) {
-            return hash;
-        }
-        const int width = frame.width > 0 && frame.width < frame.linesize0 ? frame.width : frame.linesize0;
-        for (int y = 0; y < frame.height; y += 2) {
-            const std::uint8_t* row = frame.data0 + static_cast<std::size_t>(y) * static_cast<std::size_t>(frame.linesize0);
-            for (int x = 0; x < width; x += 16) {
-                hash ^= row[x];
-                hash *= 1099511628211ull;
-            }
-        }
-        return hash;
-    };
     std::uint32_t flushed = 0;
     while (!stop_.load()) {
+        note_thread_wake();
+        if (!playing_.load() && !seek_req_.load()) {
+            std::unique_lock<std::mutex> lock(wait_mu_);
+            cv_.wait(lock, [this] { return stop_.load() || playing_.load() || seek_req_.load(); });
+            continue;
+        }
         const std::uint32_t serial = serial_.load();
         if (flushed != serial && impl_->video) {
             impl_->video->flush(serial);
@@ -639,18 +731,31 @@ void FilePlayback::video_main() {
                 stages_.decoded_us = clock_->now_us();
             }
             /* 像素留到下一次 receive 就失效，所以队列里只放 PTS、serial 和指纹。 */
-            if (serial_.load() != serial) {
-                continue;
-            }
-            if (impl_->drop_left > 0) {
-                --impl_->drop_left;
-                continue;
-            }
             VideoFrame sample;
+            sample.handle = frame.retain;
+            sample.data0 = frame.data0;
+            sample.linesize0 = frame.linesize0;
+            sample.width = frame.width;
+            sample.height = frame.height;
             sample.pts_us = frame.pts_us;
-            sample.content = hash_plane(frame);
             sample.serial = serial;
-            impl_->frames->push(sample);
+            sample.release = frame.release_retain;
+            frame.retain = nullptr;
+            frame.release_retain = nullptr;
+            const std::int64_t drop_before = drop_before_us_.load(std::memory_order_acquire);
+            if (serial_.load() != serial || impl_->drop_left > 0 || (drop_before >= 0 && frame.pts_us < drop_before)) {
+                if (impl_->drop_left > 0 && serial_.load() == serial) {
+                    --impl_->drop_left;
+                }
+                release_frame(&sample);
+                continue;
+            }
+            if (impl_->frames->push(sample) != 0) {
+                release_frame(&sample);
+            } else {
+                sample.release = nullptr;
+                sample.handle = nullptr;
+            }
             decoded_video_us_.store(frame.pts_us);
         }
         release_packet(&packet);
@@ -668,11 +773,11 @@ void FilePlayback::audio_out_main(bool software) {
     int empty_spins = 0;
     std::vector<std::int16_t> buf(static_cast<std::size_t>(std::max(impl_->channels, 1)) * 1024);
     while (!stop_.load()) {
+        note_thread_wake();
+        /* 暂停时阻塞在条件变量上，不设超时。超时会在静默窗口里把线程唤醒。 */
         if (!playing_.load() || seek_req_.load()) {
             std::unique_lock<std::mutex> lock(wait_mu_);
-            cv_.wait_for(lock, std::chrono::milliseconds(20), [this] {
-                return stop_.load() || (playing_.load() && !seek_req_.load());
-            });
+            cv_.wait(lock, [this] { return stop_.load() || (playing_.load() && !seek_req_.load()); });
             continue;
         }
         if (!armed) {
@@ -680,7 +785,7 @@ void FilePlayback::audio_out_main(bool software) {
                 armed = true;
             } else {
                 std::unique_lock<std::mutex> lock(wait_mu_);
-                cv_.wait_for(lock, std::chrono::milliseconds(20), [this] {
+                cv_.wait(lock, [this] {
                     return stop_.load() || !playing_.load() || !impl_->pcm->empty() ||
                            audio_done_serial_.load() == serial_.load();
                 });
@@ -690,7 +795,8 @@ void FilePlayback::audio_out_main(bool software) {
         if (stall_latched_.load()) {
             note_resumed(true);
             if (stall_latched_.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::unique_lock<std::mutex> lock(wait_mu_);
+                cv_.wait(lock, [this] { return stop_.load() || !playing_.load() || !stall_latched_.load(); });
                 continue;
             }
         }
@@ -730,8 +836,16 @@ void FilePlayback::audio_out_main(bool software) {
             }
             written_frames_ += got;
             if (master_ != nullptr) {
-                master_->observe_delay(written_frames_, audio_sink_->delay_frames(), impl_->rate);
+                const DelaySnapshot snap = audio_sink_->delay_snapshot();
+                master_->observe_snapshot(written_frames_, snap.frames, impl_->rate, snap.tstamp_us, monotonic_us(),
+                                          snap.have_tstamp);
                 player_->set_media_position(master_->now_us());
+                publish_audio_media_us(master_->now_us());
+            } else if (impl_->rate > 0) {
+                const std::int64_t pos =
+                    origin_us_.load(std::memory_order_relaxed) + written_frames_ * 1000000 / impl_->rate;
+                player_->set_media_position(pos);
+                publish_audio_media_us(pos);
             }
             if (!saw_audio_) {
                 saw_audio_ = true;
@@ -745,7 +859,8 @@ void FilePlayback::audio_out_main(bool software) {
         }
         if (audio_done_serial_.load() == serial && impl_->pcm->empty()) {
             if (software) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::unique_lock<std::mutex> lock(wait_mu_);
+                cv_.wait(lock, [this] { return stop_.load() || !playing_.load() || seek_req_.load(); });
                 continue;
             }
             {
@@ -778,7 +893,12 @@ void FilePlayback::audio_out_main(bool software) {
                 note_pcm_xrun();
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const std::uint64_t seen = wait_gen_.load(std::memory_order_relaxed);
+        std::unique_lock<std::mutex> lock(wait_mu_);
+        cv_.wait(lock, [this, seen, serial] {
+            return stop_.load() || !playing_.load() || seek_req_.load() || !impl_->pcm->empty() ||
+                   audio_done_serial_.load() == serial || wait_gen_.load(std::memory_order_relaxed) != seen;
+        });
     }
 #endif
 }
@@ -822,6 +942,8 @@ bool FilePlayback::notes_pending() const { return notes_.size() != 0; }
 
 void FilePlayback::bind_clock(Clock* clock) { clock_ = clock; }
 
+int FilePlayback::audio_clock_source() const { return master_ != nullptr ? master_->source() : 0; }
+
 bool FilePlayback::has_audio() const {
 #if !defined(LEGATO_HAS_FFMPEG)
     return false;
@@ -844,6 +966,13 @@ FrameQueue* FilePlayback::frames() {
 #else
     return impl_ != nullptr ? impl_->frames.get() : nullptr;
 #endif
+}
+
+int FilePlayback::copy_av_sync_us(std::int64_t* dst, int capacity) const {
+    if (video_sink_ == nullptr) {
+        return 0;
+    }
+    return video_sink_->copy_av_sync_us(dst, capacity);
 }
 
 PcmQueue* FilePlayback::pcm() {

@@ -1,6 +1,9 @@
 #include "legato/engine/test_hooks.hpp"
 
+#include "legato/core/actor.hpp"
+
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 namespace legato {
@@ -17,6 +20,10 @@ std::atomic<int> g_decode_delay_applied{0};
 std::atomic<int> g_pcm_pops{0};
 std::atomic<int> g_pcm_xruns{0};
 std::atomic<int> g_hold_demux{0};
+std::atomic<const std::uint8_t*> g_hold_ptr{nullptr};
+std::atomic<unsigned> g_hold_byte{0};
+std::atomic<int> g_hold_checks{0};
+std::atomic<int> g_hold_failed{0};
 
 int drop_from_env() {
     const char* text = std::getenv("LEGATO_TEST_DROP_VIDEO_FRAMES");
@@ -87,5 +94,58 @@ int test_pcm_xruns() { return g_pcm_xruns.load(std::memory_order_acquire); }
 void set_test_hold_demux(int hold) { g_hold_demux.store(hold ? 1 : 0, std::memory_order_release); }
 
 int test_hold_demux() { return g_hold_demux.load(std::memory_order_acquire); }
+
+int test_pcm_steady_alloc_once() {
+    const char* text = std::getenv("LEGATO_TEST_PCM_STEADY_ALLOC");
+    if (text == nullptr || text[0] == '\0' || text[0] == '0') {
+        return 0;
+    }
+    static std::atomic<int> once{0};
+    return once.exchange(1, std::memory_order_acq_rel) == 0 ? 1 : 0;
+}
+
+std::int64_t test_av_sync_offset_us() {
+    const char* text = std::getenv("LEGATO_TEST_AV_SYNC_OFFSET_US");
+    if (text == nullptr || text[0] == '\0') {
+        return 0;
+    }
+    return std::atoll(text);
+}
+
+void note_retained_frame(const std::uint8_t* still_alive, const std::uint8_t* next) {
+    const char* text = std::getenv("LEGATO_TEST_FRAME_HOLD");
+    if (text == nullptr || text[0] == '\0' || text[0] == '0') {
+        return;
+    }
+    if (g_hold_ptr.load(std::memory_order_acquire) != nullptr && still_alive != nullptr) {
+        g_hold_checks.fetch_add(1, std::memory_order_relaxed);
+        if (*still_alive != static_cast<std::uint8_t>(g_hold_byte.load(std::memory_order_relaxed))) {
+            g_hold_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (next == nullptr) {
+        return;
+    }
+    g_hold_byte.store(*next, std::memory_order_relaxed);
+    g_hold_ptr.store(next, std::memory_order_release);
+}
+
+int test_frame_hold_failed() { return g_hold_failed.load(std::memory_order_acquire); }
+
+int test_frame_hold_checks() { return g_hold_checks.load(std::memory_order_acquire); }
+
+int test_no_audio_device() {
+    const char* text = std::getenv("LEGATO_TEST_NO_AUDIO_DEVICE");
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
+void log_test_quiet() {
+    if (std::getenv("LEGATO_TEST_QUIET") != nullptr) {
+        std::fprintf(stderr, "quiet_wakes=%llu\n", static_cast<unsigned long long>(quiet_wake_count()));
+    }
+    if (std::getenv("LEGATO_TEST_FRAME_HOLD") != nullptr) {
+        std::fprintf(stderr, "frame_hold failed=%d checks=%d\n", test_frame_hold_failed(), test_frame_hold_checks());
+    }
+}
 
 }  /* namespace legato */

@@ -32,7 +32,6 @@ add_library(legato_core STATIC
   core/src/alloc.cpp
   core/src/actor.cpp
   pal/src/clock.cpp
-  engine/src/scheduler.cpp
   engine/src/presets.gen.cpp
   engine/src/errors.gen.cpp
 )
@@ -81,8 +80,11 @@ add_library(legato SHARED
   engine/src/clock.cpp
   engine/src/corpus.cpp
   engine/src/test_hooks.cpp
+  core/src/alloc_wrap.cpp
   io/src/file_source.cpp
-  render/src/null_sink.cpp
+  io/src/callback_source.cpp
+    render/src/null_sink.cpp
+    render/src/gl_sink.cpp
   api/src/abi.cpp
 )
 if(LEGATO_HAS_FFMPEG)
@@ -103,7 +105,19 @@ if(LEGATO_HAS_FFMPEG)
     target_link_libraries(legato PRIVATE m)
   endif()
 endif()
+find_path(LEGATO_CURL_INCLUDE curl/curl.h
+  PATHS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/curl-7.61.1/include" /usr/include)
+find_library(LEGATO_CURL NAMES curl libcurl.so.4 PATHS /usr/lib64 /usr/lib)
+if(LEGATO_CURL_INCLUDE AND LEGATO_CURL)
+  set(LEGATO_HAS_CURL ON)
+  target_sources(legato PRIVATE io/src/http_source.cpp)
+  target_include_directories(legato PRIVATE "${LEGATO_CURL_INCLUDE}")
+  target_compile_definitions(legato PRIVATE LEGATO_HAS_CURL=1)
+  target_link_libraries(legato PRIVATE "${LEGATO_CURL}")
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(legato PRIVATE render/src/pipewire_sink.cpp render/src/linux_audio.cpp)
+  target_link_libraries(legato PRIVATE ${CMAKE_DL_LIBS})
   find_library(LEGATO_ASOUND asound)
   if(LEGATO_HAS_FFMPEG AND LEGATO_ASOUND)
     target_sources(legato PRIVATE render/src/alsa_sink.cpp)
@@ -131,12 +145,30 @@ set_target_properties(legato PROPERTIES
 if(UNIX AND NOT APPLE)
   target_link_options(legato PRIVATE
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg/liblegato.version"
-    "-Wl,--no-undefined")
+    "-Wl,--no-undefined"
+    "-Wl,--wrap=malloc"
+    "-Wl,--wrap=calloc"
+    "-Wl,--wrap=realloc"
+    "-Wl,--wrap=posix_memalign")
+endif()
+
+execute_process(
+  COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --short=12 HEAD
+  OUTPUT_VARIABLE LEGATO_GIT_COMMIT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(NOT LEGATO_GIT_COMMIT)
+  set(LEGATO_GIT_COMMIT "unknown")
 endif()
 
 add_executable(legato-bench bench/src/bench_main.cpp)
 target_include_directories(legato-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/src)
-target_compile_definitions(legato-bench PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(legato-bench PRIVATE
+  LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  LEGATO_BUILD_COMMIT="${LEGATO_GIT_COMMIT}"
+  LEGATO_BUILD_CONFIG="play-demo"
+  LEGATO_FFMPEG_VERSION="5.1.6")
 target_compile_options(legato-bench PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato-bench PRIVATE legato)
 
@@ -150,6 +182,12 @@ target_compile_definitions(legato_smoke PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRE
 target_compile_options(legato_smoke PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato_smoke PRIVATE legato)
 
+add_executable(legato_clock_tests tests/clock_tests.cpp engine/src/clock.cpp pal/src/clock.cpp)
+target_include_directories(legato_clock_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/pal/include)
+target_compile_options(legato_clock_tests PRIVATE -Wall -Wextra -Wpedantic)
+
 add_executable(legato_core_tests tests/core_tests.cpp)
 target_compile_options(legato_core_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(legato_core_tests PRIVATE legato_core)
@@ -161,8 +199,20 @@ target_compile_options(legato_parse_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
 add_test(NAME core COMMAND legato_core_tests)
+add_test(NAME audio_clock COMMAND legato_clock_tests)
 add_test(NAME parse COMMAND legato_parse_tests)
 add_test(NAME smoke COMMAND legato_smoke)
+add_executable(legato_quiet_tests tests/quiet_tests.c)
+target_compile_definitions(legato_quiet_tests PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(legato_quiet_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(legato_quiet_tests PRIVATE legato)
+add_test(NAME quiet_idle
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_quiet.py $<TARGET_FILE:legato_quiet_tests> idle)
+add_test(NAME quiet_pause
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_quiet.py $<TARGET_FILE:legato_quiet_tests> pause
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(quiet_idle PROPERTIES TIMEOUT 20)
+set_tests_properties(quiet_pause PROPERTIES TIMEOUT 60)
 add_executable(legato_m05_tests tests/m05_tests.c)
 target_compile_definitions(legato_m05_tests PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(legato_m05_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -175,6 +225,12 @@ add_test(NAME symbols
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_symbols.sh $<TARGET_FILE:legato>)
 add_test(NAME synthetic_dry_run
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/generate_synthetic.py --dry-run)
+add_test(NAME synthetic_corpus_flags
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/generate_synthetic.py --check-command)
+add_test(NAME t1_seek
+  COMMAND legato-bench run bench/scenarios/seek-local.yaml --golden bench/golden/seek-local.json
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(t1_seek PROPERTIES TIMEOUT 120)
 add_test(NAME t1_startup
   COMMAND legato-bench run bench/scenarios/startup-local.yaml --golden bench/golden/startup-local.json
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -189,12 +245,79 @@ add_test(NAME t1_feed
   COMMAND legato-bench run bench/scenarios/feed-swipe-4g.yaml --golden bench/golden/feed-swipe-4g.json
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(t1_startup t1_feed PROPERTIES TIMEOUT 120)
+add_test(NAME t1_alloc_pcm
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_gate.py
+          $<TARGET_FILE:legato-bench>
+          bench/scenarios/startup-local.yaml
+          bench/golden/startup-local.json
+          alloc
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME t1_av_sync_offset
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_gate.py
+          $<TARGET_FILE:legato-bench>
+          bench/scenarios/startup-local.yaml
+          bench/golden/startup-local.json
+          sync
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(t1_alloc_pcm PROPERTIES
+  ENVIRONMENT "LEGATO_TEST_PCM_STEADY_ALLOC=1"
+  TIMEOUT 120)
+set_tests_properties(t1_av_sync_offset PROPERTIES
+  ENVIRONMENT "LEGATO_TEST_AV_SYNC_OFFSET_US=100000"
+  TIMEOUT 120)
+if(LEGATO_HAS_FFMPEG)
+  add_executable(legato_av_sync_file tests/av_sync_file.c)
+  target_compile_definitions(legato_av_sync_file PRIVATE LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_options(legato_av_sync_file PRIVATE -Wall -Wextra -Wpedantic)
+  target_link_libraries(legato_av_sync_file PRIVATE legato)
+  find_library(LEGATO_EGL EGL)
+  find_library(LEGATO_GL GL)
+  if(LEGATO_EGL AND LEGATO_GL)
+    target_compile_definitions(legato_av_sync_file PRIVATE LEGATO_HAS_EGL=1)
+    target_link_libraries(legato_av_sync_file PRIVATE "${LEGATO_EGL}" "${LEGATO_GL}")
+  endif()
+  add_test(NAME av_sync_file
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/flash_beep.py $<TARGET_FILE:legato_av_sync_file> ok
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME av_sync_file_offset
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/flash_beep.py $<TARGET_FILE:legato_av_sync_file> offset
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(av_sync_file PROPERTIES
+    ENVIRONMENT "LEGATO_TEST_NO_AUDIO_DEVICE=1"
+    TIMEOUT 60)
+  set_tests_properties(av_sync_file_offset PROPERTIES
+    ENVIRONMENT "LEGATO_TEST_NO_AUDIO_DEVICE=1;LEGATO_TEST_AV_SYNC_OFFSET_US=100000"
+    TIMEOUT 60)
+  if(LEGATO_HAS_CURL)
+    add_executable(legato_http_playback tests/http_playback.c)
+    target_compile_options(legato_http_playback PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(legato_http_playback PRIVATE legato)
+    add_test(NAME http_range
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/http_playback.py $<TARGET_FILE:legato_http_playback> range
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME http_plain
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/http_playback.py $<TARGET_FILE:legato_http_playback> plain
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME http_callback
+      COMMAND legato_http_playback callback
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(http_range http_plain http_callback PROPERTIES
+      ENVIRONMENT "LEGATO_TEST_NO_AUDIO_DEVICE=1"
+      TIMEOUT 60)
+  endif()
+endif()
 add_test(NAME python_abi
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/bindings/python/legato.py $<TARGET_FILE:legato>)
 if(LEGATO_HAS_FFMPEG)
   add_executable(legato_play examples/play.c)
   target_compile_options(legato_play PRIVATE -Wall -Wextra -Wpedantic)
   target_link_libraries(legato_play PRIVATE legato)
+  set(SDL2_DIR "${CMAKE_CURRENT_BINARY_DIR}/sdl2-install/lib64/cmake/SDL2")
+  find_package(SDL2 QUIET CONFIG)
+  if(TARGET SDL2::SDL2-static)
+    target_compile_definitions(legato_play PRIVATE LEGATO_HAS_SDL2=1)
+    target_link_libraries(legato_play PRIVATE SDL2::SDL2-static SDL2::SDL2main)
+  endif()
   add_test(NAME play_tone
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/play_tone.py $<TARGET_FILE:legato_play>
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

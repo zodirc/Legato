@@ -1,16 +1,16 @@
 {
   "scenario": {"id": "startup-local", "hash": "sha256:ccec727647cdffc88567d24b82befe148103f11347e93f92897b795cf859bb3b"},
-  "build": {"commit": "GIT", "config": "skeleton", "ffmpeg": "none", "quirks_db": "none"},
+  "build": {"commit": "8da4fc661c36", "config": "play-demo", "ffmpeg": "5.1.6", "quirks_db": "none"},
   "env": {"tier": "T1", "device": "headless", "os": "linux", "backend": "legato", "model": "pipeline", "preset": "vod", "simulated_network": false, "network_trace": ""},
   "runs": 1,
   "metrics": {
     "first_frame_ms": {"unit": "ms", "samples": [16], "p50": 16, "p90": 16},
-    "first_frame_breakdown": {"unit": "us", "probe": 0, "first_packet": 0, "decoder_open": 0, "first_frame_decoded": 0, "first_frame_presented": 16667, "cache_hit": false, "decoder_reused": false},
+    "first_frame_breakdown": {"unit": "us", "probe": null, "first_packet": null, "decoder_open": null, "first_frame_decoded": null, "first_frame_presented": 16667, "cache_hit": false, "decoder_reused": false},
     "stall_ratio": {"unit": "ratio", "value": 0.000000},
     "alloc_steady": {"unit": "count", "value": 0},
-    "av_sync_ms": {"unit": "ms", "p95": 0}
+    "av_sync_ms": {"unit": "ms", "p50": 0, "p95": 0, "max": 16}
   },
   "events": ["state_changed", "command_done", "command_done", "first_frame", "state_changed", "seek", "command_done", "ended", "state_changed"],
-  "presentation_sha256": "c842c714eb24159cb52716d65ede2a3e407bb4aff06b9cfcd439944918d5345b",
+  "presentation_sha256": "0ff03217addd1d91aaee0fcd1d73e4c2d3c8d85c3c7038d9a5a1a0a31c0e37a7",
   "gates": {"alloc_steady_eq_0": true, "av_sync_p95_lt_40ms": true}
 }

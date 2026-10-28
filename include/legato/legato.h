@@ -92,7 +92,22 @@ typedef struct legato_session_stats {
     int32_t cache_hit;
     int32_t decoder_reused_last;
     int32_t events_dropped;
+    /* 0 没有音频主时钟，1 硬件时间戳，2 delay。 */
+    int32_t audio_clock_source;
     char presentation_sha256[65];
+    /* Seek 之后第一帧的 PTS。还没有呈现时为 -1。 */
+    int64_t seek_first_pts_us;
+    int32_t seek_stale_frames;
+    int32_t seek_commits;
+    /* VideoPresenter 因晚于当前拍而丢掉的帧。 */
+    int32_t dropped_frames;
+    /* HTTP 打开的四段。不是 HTTP 时为 -1。明文 HTTP 的 TLS 段是 0。 */
+    int64_t stage_dns_us;
+    int64_t stage_connect_us;
+    int64_t stage_tls_us;
+    int64_t stage_first_byte_us;
+    /* 1 可以 Seek。服务端没有 Accept-Ranges 时是 0，会话不因此进入 error。 */
+    int32_t source_seekable;
 } legato_session_stats;
 
 LEGATO_API uint32_t legato_abi_version(void);
@@ -119,6 +134,8 @@ LEGATO_API int legato_player_pause(legato_player* player);
 LEGATO_API int legato_player_seek(legato_player* player, int64_t position_us, legato_seek_mode mode);
 LEGATO_API int64_t legato_player_position_us(legato_player* player);
 LEGATO_API int legato_player_read_stats(legato_player* player, legato_session_stats* out);
+/* 返回本次播放已经记录的音画偏差样本数，单位微秒，取绝对值。dst 可空，只查询数量。 */
+LEGATO_API int legato_player_copy_av_sync_us(legato_player* player, int64_t* dst, int capacity);
 
 LEGATO_API void legato_player_set_wakeup(legato_player* player, void (*callback)(void*), void* userdata);
 LEGATO_API const legato_event* legato_player_next_event(legato_player* player);

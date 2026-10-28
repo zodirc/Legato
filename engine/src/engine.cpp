@@ -3,9 +3,12 @@
 #include "legato/core/json_mini.hpp"
 #include "legato/engine/player.hpp"
 
+#include "legato/engine/test_hooks.hpp"
+
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <utility>
@@ -75,13 +78,19 @@ Engine::Engine(const char* config_json) {
         corpus_root_.assign(root_begin, root_end);
     }
     observe_ = std::thread([this] { observe_main(); });
+    const char* quiet = std::getenv("LEGATO_TEST_QUIET");
+    if (quiet != nullptr && std::strcmp(quiet, "idle") == 0) {
+        arm_quiet_window(200000);
+    }
 }
 
 void Engine::shutdown() {
     observe_stop_.store(true);
+    poke_observe();
     if (observe_.joinable()) {
         observe_.join();
     }
+    log_test_quiet();
     reclaim_.stop();
     control_.stop();
 }
@@ -112,13 +121,59 @@ void Engine::unregister_player(Player* player) {
     players_.swap(kept);
 }
 
+void Engine::poke_observe() {
+    {
+        std::lock_guard<std::mutex> lock(observe_mu_);
+        ++observe_gen_;
+    }
+    observe_cv_.notify_all();
+}
+
 void Engine::observe_main() {
+    std::uint64_t seen = 0;
     while (!observe_stop_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::int64_t delay_us = -1;
+        std::vector<std::shared_ptr<Player>> live;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (const std::weak_ptr<Player>& item : players_) {
+                if (std::shared_ptr<Player> player = item.lock()) {
+                    live.push_back(std::move(player));
+                }
+            }
+        }
+        for (const std::shared_ptr<Player>& player : live) {
+            const std::int64_t delay = player->claim_observe_delay_us();
+            if (delay < 0) {
+                continue;
+            }
+            if (delay_us < 0 || delay < delay_us) {
+                delay_us = delay;
+            }
+        }
+        if (delay_us == 0) {
+            note_thread_wake();
+            post([this] { poll_observers(); });
+            continue;
+        }
+        std::unique_lock<std::mutex> lock(observe_mu_);
         if (observe_stop_.load()) {
             return;
         }
-        post([this] { poll_observers(); });
+        if (observe_gen_ != seen) {
+            seen = observe_gen_;
+            continue;
+        }
+        if (delay_us < 0) {
+            observe_cv_.wait(lock, [this, seen] { return observe_stop_.load() || observe_gen_ != seen; });
+        } else {
+            observe_cv_.wait_for(lock, std::chrono::microseconds(delay_us),
+                                 [this, seen] { return observe_stop_.load() || observe_gen_ != seen; });
+        }
+        if (observe_stop_.load()) {
+            return;
+        }
+        seen = observe_gen_;
     }
 }
 
@@ -159,23 +214,9 @@ int Engine::advance_us(std::int64_t delta_us) {
         std::int64_t left = delta_us;
         while (left > 0) {
             const std::int64_t step = left > kVsyncUs ? kVsyncUs : left;
-            std::vector<Scheduler::Task> due;
-            std::vector<std::int64_t> whens;
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 virtual_clock_.advance_us(step);
-                scheduler_.advance_clock(step);
-                Scheduler::Task task;
-                std::int64_t when_us = 0;
-                while (scheduler_.take_due(&task, &when_us)) {
-                    due.push_back(std::move(task));
-                    whens.push_back(when_us);
-                }
-            }
-            for (std::size_t i = 0; i < due.size(); ++i) {
-                if (due[i]) {
-                    due[i](whens[i]);
-                }
             }
             left -= step;
         }
@@ -237,6 +278,20 @@ int Engine::register_source(const char* scheme, int (*read)(void*, std::uint8_t*
         rc = 0;
     }
     return rc;
+}
+
+bool Engine::copy_source(const char* scheme, SourceRegistration* out) {
+    if (scheme == nullptr || out == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& item : sources_) {
+        if (item.used && std::strcmp(item.scheme, scheme) == 0) {
+            *out = item;
+            return true;
+        }
+    }
+    return false;
 }
 
 }  /* namespace legato */

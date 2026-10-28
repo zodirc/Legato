@@ -7,7 +7,6 @@
 #include "legato/engine/error_info.hpp"
 #include "legato/engine/uri_path.hpp"
 #include "legato/engine/preset.hpp"
-#include "legato/engine/scheduler.hpp"
 #include "legato/io/data_source.hpp"
 #include "legato/pal/clock.hpp"
 #include "legato/render/sink.hpp"
@@ -16,7 +15,6 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
-#include <vector>
 
 namespace {
 
@@ -80,25 +78,6 @@ void test_actor() {
     }
     threaded.stop();
     CHECK(counter.load() == 1000);
-}
-
-void test_scheduler() {
-    legato::Scheduler scheduler;
-    std::vector<int> order;
-    scheduler.schedule(1, 30, [&order](std::int64_t) { order.push_back(30); });
-    scheduler.schedule(1, 10, [&order](std::int64_t) { order.push_back(10); });
-    scheduler.schedule(2, 20, [&order](std::int64_t) { order.push_back(20); });
-    scheduler.advance(100);
-    CHECK(order.size() == 3);
-    CHECK(order.size() == 3 && order[0] == 10 && order[1] == 20 && order[2] == 30);
-    CHECK(scheduler.now() == 100);
-
-    scheduler.schedule(7, 150, [&order](std::int64_t) { order.push_back(7); });
-    scheduler.schedule(8, 160, [&order](std::int64_t) { order.push_back(8); });
-    scheduler.cancel(7);
-    scheduler.advance(100);
-    CHECK(order.size() == 4 && order[3] == 8);
-    CHECK(scheduler.now() == 200);
 }
 
 void test_alloc() {
@@ -174,7 +153,6 @@ int main() {
     test_spsc();
     test_pool();
     test_actor();
-    test_scheduler();
     test_alloc();
     test_clock_and_presets();
     test_errors();

@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <vector>
 #include <mutex>
 #include <thread>
 
@@ -40,9 +41,13 @@ public:
     int observe(const char* property, double min_interval_s, std::uint64_t tag);
     std::int64_t position_us() const;
     int read_stats(legato_session_stats* out);
+    int copy_av_sync_us(std::int64_t* dst, int capacity);
+    /* 没有 observe 时返回 -1。有到期项时返回 0，并把下一次到期往后推。 */
+    std::int64_t claim_observe_delay_us();
     const legato_event* next_event();
     void set_wakeup(void (*callback)(void*), void* userdata);
     int attach_surface(void* handle);
+    int render_gl(unsigned fbo, int width, int height);
 
     /* Called with Engine::mu_ held. */
     void on_clock_advanced();
@@ -71,30 +76,36 @@ private:
         bool used = false;
         char name[64]{};
         double min_interval_s = 0;
+        std::int64_t next_due_us = 0;
         std::uint64_t tag = 0;
     };
 
+    enum class LoadKind { File, Http, Callback };
+
     struct OpenJob {
         bool pending = false;
-        char path[4096]{};
+        LoadKind kind = LoadKind::File;
+        char path[LEGATO_URI_MAX]{};
+        SourceRegistration reg{};
         std::uint64_t generation = 0;
         std::uint64_t command_id = 0;
         bool virtual_clock = false;
         bool decode_video = true;
+        bool allow_audio_fallback = false;
         double buffer_start_s = 1.5;
         double buffer_resume_s = 3;
         double buffer_max_s = 50;
     };
 
-    bool begin_load_locked(const char* uri, std::uint64_t command_id);
+    bool begin_load_locked(const char* uri, std::uint64_t command_id, const SourceRegistration* reg);
     void io_main();
-    void finish_open(std::uint64_t generation, std::uint64_t command_id, bool ok);
     void finish_open_job(const OpenJob& job, std::shared_ptr<FilePlayback> playback, int rc);
     bool play_locked();
     bool pause_locked();
     bool seek_locked(std::int64_t position_us, int mode);
+    void coalesce_seeks();
     bool stop_locked();
-    void update_position_locked();
+    std::int64_t event_time_locked() const;
     void emit_locked(int type, std::int64_t time_us, const char* json);
     bool same_merge(const EventSlot& slot, int type, const char* json) const;
     void complete_command_locked(std::uint64_t command_id, bool ok);
@@ -137,8 +148,12 @@ private:
     std::int64_t watch_at_us_[8]{};
     int state_ = LEGATO_STATE_IDLE;
     int serial_ = 1;
+    int open_seek_mode_ = 0;
+    bool seek_posted_ = false;
+    std::int64_t seek_pos_ = 0;
+    int seek_mode_pending_ = 0;
+    std::vector<std::uint64_t> seek_ids_;
     std::int64_t media_start_us_ = 0;
-    std::int64_t origin_us_ = 0;
     std::int64_t load_us_ = 0;
     std::int64_t duration_us_ = 60 * 1000 * 1000;
     std::int64_t startup_us_ = 120000;
@@ -147,6 +162,11 @@ private:
     std::int64_t stage_decoder_open_us_ = 0;
     std::int64_t stage_decoded_us_ = 0;
     std::int64_t stage_presented_us_ = 0;
+    std::int64_t stage_dns_us_ = -1;
+    std::int64_t stage_connect_us_ = -1;
+    std::int64_t stage_tls_us_ = -1;
+    std::int64_t stage_first_byte_us_ = -1;
+    int source_seekable_ = 1;
     int cache_hit_ = 0;
     int decoder_reused_last_ = 0;
     int presented_ = 0;

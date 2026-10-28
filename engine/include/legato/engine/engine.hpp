@@ -3,9 +3,9 @@
 
 #include "legato/core/actor.hpp"
 #include "legato/engine/clock.hpp"
-#include "legato/engine/scheduler.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -49,9 +49,13 @@ public:
     int register_source(const char* scheme, int (*read)(void*, std::uint8_t*, int),
                         std::int64_t (*seek)(void*, std::int64_t, int), std::int64_t (*length)(void*),
                         void* userdata);
+    /* 复制登记项。调用方不要在持有 Player::mu_ 时调用，锁顺序是 Engine::mu_ 在前。 */
+    bool copy_source(const char* scheme, SourceRegistration* out);
     void post(std::function<void()> task);
     void post_and_wait(std::function<void()> task);
     void post_reclaim(std::function<void()> task);
+    /* 有 observe 时让观测线程按下一个到期点醒来。没有 observe 时它继续阻塞。 */
+    void poke_observe();
 
 private:
     void register_player(const std::shared_ptr<Player>& player);
@@ -60,13 +64,15 @@ private:
     void observe_main();
 
     std::mutex mu_;
-    Scheduler scheduler_;
     VirtualClock virtual_clock_;
     Actor control_{true};
     Actor reclaim_{true};
     std::thread::id control_id_{};
     std::thread observe_;
     std::atomic<bool> observe_stop_{false};
+    std::mutex observe_mu_;
+    std::condition_variable observe_cv_;
+    std::uint64_t observe_gen_ = 0;
     std::vector<std::weak_ptr<Player>> players_;
     bool headless_ = true;
     bool warmed_ = false;

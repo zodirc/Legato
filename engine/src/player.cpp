@@ -8,25 +8,53 @@
 #include "legato/engine/corpus.hpp"
 #include "legato/engine/error_info.hpp"
 #include "legato/engine/file_playback.hpp"
+#include "legato/io/callback_source.hpp"
+#include "legato/io/file_source.hpp"
+#if defined(LEGATO_HAS_CURL)
+#include "legato/io/http_source.hpp"
+#endif
 #include "legato/engine/output_note.hpp"
 #include "legato/engine/test_hooks.hpp"
 #include "legato/pal/clock.hpp"
 #include "legato/render/sink.hpp"
-#if defined(LEGATO_HAS_ALSA)
+#if defined(__linux__)
+#include "legato/render/linux_audio.hpp"
+#elif defined(LEGATO_HAS_ALSA)
 #include "legato/render/alsa_sink.hpp"
 #endif
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace legato {
 namespace {
 
 std::atomic<std::uint64_t> g_player_ids{1};
+
+bool scheme_name(const char* uri, char* out, std::size_t out_len) {
+    if (uri == nullptr || out == nullptr || out_len == 0) {
+        return false;
+    }
+    const char* sep = std::strstr(uri, "://");
+    if (sep == nullptr || sep == uri) {
+        return false;
+    }
+    const std::size_t len = static_cast<std::size_t>(sep - uri);
+    if (len == 0 || len >= out_len || len >= 32) {
+        return false;
+    }
+    for (std::size_t i = 0; i < len; ++i) {
+        out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(uri[i])));
+    }
+    out[len] = '\0';
+    return true;
+}
 
 void copy_json_string(char* dst, size_t dst_len, const char* text) {
     if (dst_len == 0) {
@@ -78,7 +106,6 @@ void Player::request_release() {
             playback->stop();
         }
         std::lock_guard<std::mutex> lock(self->engine_->mu_);
-        self->engine_->scheduler_.cancel(self->id_);
         self->engine_->unregister_player(self.get());
     });
 }
@@ -131,8 +158,9 @@ void Player::dispatch(bool wake) {
 }
 
 bool Player::protected_event(int type) const {
+    /* audio_fallback 只发一次。后面的 state_changed 不能把它挤掉，否则调用方不知道这次没有打开 PCM 设备。 */
     return type == LEGATO_EVENT_TYPE_ERROR || type == LEGATO_EVENT_TYPE_ENDED || type == LEGATO_EVENT_TYPE_FIRST_FRAME ||
-           type == LEGATO_EVENT_TYPE_STATE_CHANGED;
+           type == LEGATO_EVENT_TYPE_STATE_CHANGED || type == LEGATO_EVENT_TYPE_AUDIO_FALLBACK;
 }
 
 bool Player::same_merge(const EventSlot& slot, int type, const char* json) const {
@@ -201,7 +229,7 @@ void Player::complete_command_locked(std::uint64_t command_id, bool ok) {
     char json[64];
     std::snprintf(json, sizeof(json), "{\"id\":%llu,\"ok\":%s}", static_cast<unsigned long long>(command_id),
                   ok ? "true" : "false");
-    emit_locked(LEGATO_EVENT_TYPE_COMMAND_DONE, engine_->scheduler_.now(), json);
+    emit_locked(LEGATO_EVENT_TYPE_COMMAND_DONE, event_time_locked(), json);
 }
 
 void Player::set_error_locked(const char* name, const char* message) {
@@ -214,12 +242,12 @@ void Player::set_error_locked(const char* name, const char* message) {
                   "\"message\":\"%s\",\"hint\":\"%s\",\"trace_id\":\"%s\"}",
                   category, name, retryable ? "true" : "false", message != nullptr ? message : "", hint, trace_id_);
     state_ = LEGATO_STATE_ERROR;
-    const std::int64_t now = engine_->scheduler_.now();
+    const std::int64_t now = event_time_locked();
     emit_locked(LEGATO_EVENT_TYPE_ERROR, now, last_error_);
     emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"error\"}");
 }
 
-bool Player::begin_load_locked(const char* uri, std::uint64_t command_id) {
+bool Player::begin_load_locked(const char* uri, std::uint64_t command_id, const SourceRegistration* reg) {
     leave_steady_state();
     /* 同一次会话可以反复 load。trace_id 跟这一次打开走，不跟对象寿命走。 */
     std::snprintf(trace_id_, sizeof(trace_id_), "p-%016llx",
@@ -228,13 +256,24 @@ bool Player::begin_load_locked(const char* uri, std::uint64_t command_id) {
     first_frame_sent_ = false;
     file_mode_ = false;
     ++generation_;
+    stage_dns_us_ = -1;
+    stage_connect_us_ = -1;
+    stage_tls_us_ = -1;
+    stage_first_byte_us_ = -1;
+    source_seekable_ = 1;
     if (uri == nullptr || uri[0] == '\0') {
         set_error_locked("invalid_argument", "uri 为空");
         complete_command_locked(command_id, false);
         return true;
     }
-    char path[4096];
+    if (std::strlen(uri) >= LEGATO_URI_MAX) {
+        set_error_locked("invalid_argument", "路径太长");
+        complete_command_locked(command_id, false);
+        return true;
+    }
+    char path[LEGATO_URI_MAX];
     bool virtual_clock = false;
+    Player::LoadKind kind = Player::LoadKind::File;
     if (std::strncmp(uri, "corpus:", 7) == 0) {
         const char* err_name = nullptr;
         const char* err_message = nullptr;
@@ -254,32 +293,55 @@ bool Player::begin_load_locked(const char* uri, std::uint64_t command_id) {
         }
         virtual_clock = true;
     } else {
-        const int kind = local_file_path(uri, path, sizeof(path));
-        if (kind < 0) {
+        const int local = local_file_path(uri, path, sizeof(path));
+        if (local < 0) {
             set_error_locked("invalid_argument", "路径太长");
             complete_command_locked(command_id, false);
             return true;
         }
-        if (kind == 0) {
-            set_error_locked("unsupported_scheme", "这个协议还不能播");
-            complete_command_locked(command_id, false);
-            return true;
+        if (local == 0) {
+            char scheme[32];
+            if (scheme_name(uri, scheme, sizeof(scheme)) &&
+                (std::strcmp(scheme, "http") == 0 || std::strcmp(scheme, "https") == 0)) {
+                /* http 由引擎内置。应用登记同名 scheme 也不能绕过 libcurl。 */
+                kind = Player::LoadKind::Http;
+                std::snprintf(path, sizeof(path), "%s", uri);
+#if !defined(LEGATO_HAS_CURL)
+                set_error_locked("unsupported_scheme", "这个协议还不能播");
+                complete_command_locked(command_id, false);
+                return true;
+#endif
+            } else if (reg != nullptr && reg->read != nullptr && scheme_name(uri, scheme, sizeof(scheme)) &&
+                       std::strcmp(reg->scheme, scheme) == 0) {
+                kind = Player::LoadKind::Callback;
+                std::snprintf(path, sizeof(path), "%s", uri);
+            } else {
+                set_error_locked("unsupported_scheme", "这个协议还不能播");
+                complete_command_locked(command_id, false);
+                return true;
+            }
         }
     }
     virtual_session_ = virtual_clock;
     segment_set_ = false;
     io_busy_ = true;
     state_ = LEGATO_STATE_LOADING;
-    load_us_ = engine_->scheduler_.now();
+    load_us_ = event_time_locked();
     file_load_mono_ = monotonic_us();
     emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, load_us_, "{\"state\":\"loading\"}");
     {
         std::lock_guard<std::mutex> io_lock(io_mu_);
         std::snprintf(io_job_.path, sizeof(io_job_.path), "%s", path);
+        io_job_.kind = kind;
+        io_job_.reg = {};
+        if (kind == Player::LoadKind::Callback && reg != nullptr) {
+            io_job_.reg = *reg;
+        }
         io_job_.generation = generation_;
         io_job_.command_id = command_id;
         io_job_.virtual_clock = virtual_clock;
         io_job_.decode_video = preset_ != nullptr && preset_->video;
+        io_job_.allow_audio_fallback = preset_ != nullptr && preset_->audio_fallback;
         io_job_.buffer_start_s = preset_ != nullptr ? preset_->buffer_start_s : 1.5;
         io_job_.buffer_resume_s = preset_ != nullptr ? preset_->buffer_resume_s : 3;
         io_job_.buffer_max_s = preset_ != nullptr ? preset_->buffer_max_s : 50;
@@ -292,6 +354,7 @@ bool Player::begin_load_locked(const char* uri, std::uint64_t command_id) {
 /* IO 线程只打开文件。这里不持有 Engine::mu_ 或 Player::mu_，打开可以阻塞。 */
 void Player::io_main() {
     while (!io_stop_.load()) {
+        note_thread_wake();
         OpenJob job;
         {
             std::unique_lock<std::mutex> lock(io_mu_);
@@ -311,19 +374,31 @@ void Player::io_main() {
             video = std::make_unique<RecordingVideoSink>();
             clock = &engine_->virtual_clock();
         } else {
-#if defined(LEGATO_HAS_ALSA)
+#if defined(__linux__)
+            audio = std::make_unique<LinuxAudioSink>();
+#elif defined(LEGATO_HAS_ALSA)
             audio = std::make_unique<AlsaSink>();
 #else
             audio = std::make_unique<UnavailableAudioSink>();
 #endif
-            video = std::make_unique<CountingVideoSink>();
+            video = std::make_unique<GlVideoSink>();
             master = std::make_unique<AudioMasterClock>();
             clock = master.get();
         }
         auto playback = std::make_shared<FilePlayback>(this, clock, std::move(audio), std::move(video), std::move(master),
                                                        job.decode_video, job.buffer_start_s, job.buffer_resume_s,
-                                                       job.buffer_max_s);
-        const int rc = playback->open(job.path);
+                                                       job.buffer_max_s, job.allow_audio_fallback);
+        std::unique_ptr<DataSource> source;
+        if (job.kind == LoadKind::Http) {
+#if defined(LEGATO_HAS_CURL)
+            source = std::make_unique<HttpSource>(job.path);
+#endif
+        } else if (job.kind == LoadKind::Callback) {
+            source = std::make_unique<CallbackSource>(job.reg);
+        } else {
+            source = std::make_unique<FileSource>(job.path);
+        }
+        const int rc = source != nullptr ? playback->open_source(std::move(source)) : -1;
         if (rc == 0 && !job.virtual_clock && !playback->has_audio()) {
             playback->bind_clock(playback->monotonic_clock());
         }
@@ -332,12 +407,6 @@ void Player::io_main() {
         std::shared_ptr<Player> self = shared_from_this();
         engine_->post([self, job, playback, rc] { self->finish_open_job(job, playback, rc); });
     }
-}
-
-void Player::finish_open(std::uint64_t generation, std::uint64_t command_id, bool ok) {
-    (void)generation;
-    (void)command_id;
-    (void)ok;
 }
 
 void Player::finish_open_job(const OpenJob& job, std::shared_ptr<FilePlayback> playback, int rc) {
@@ -361,11 +430,24 @@ void Player::finish_open_job(const OpenJob& job, std::shared_ptr<FilePlayback> p
         } else {
             playback_ = std::move(playback);
             file_mode_ = true;
-            const FilePlayback::Stages stages = playback_->stages();
-            stage_probe_us_ = stages.probe_us;
-            stage_first_packet_us_ = stages.first_packet_us;
-            stage_decoder_open_us_ = stages.decoder_open_us;
-            stage_decoded_us_ = stages.decoded_us;
+            if (job.virtual_clock) {
+                /* 虚拟媒体时钟在打开期间不前进，这四段不是测量值。-1 让基准写成 null。 */
+                stage_probe_us_ = -1;
+                stage_first_packet_us_ = -1;
+                stage_decoder_open_us_ = -1;
+                stage_decoded_us_ = -1;
+            } else {
+                const FilePlayback::Stages stages = playback_->stages();
+                stage_probe_us_ = stages.probe_us;
+                stage_first_packet_us_ = stages.first_packet_us;
+                stage_decoder_open_us_ = stages.decoder_open_us;
+                stage_decoded_us_ = stages.decoded_us;
+                stage_dns_us_ = stages.dns_us;
+                stage_connect_us_ = stages.connect_us;
+                stage_tls_us_ = stages.tls_us;
+                stage_first_byte_us_ = stages.first_byte_us;
+                source_seekable_ = playback_->session_seekable() ? 1 : 0;
+            }
             if (playback_->duration_us() > 0) {
                 duration_us_ = playback_->duration_us();
             }
@@ -380,10 +462,13 @@ void Player::finish_open_job(const OpenJob& job, std::shared_ptr<FilePlayback> p
             }
             /* load 之前的 Seek 只写过 media_start。打开完成后补一次，解码从目标位置开始。 */
             if (media_start_us_ > 0) {
-                playback_->seek(media_start_us_, static_cast<std::uint32_t>(serial_));
+                playback_->seek_to(media_start_us_, static_cast<std::uint32_t>(serial_), open_seek_mode_);
             }
             if (playing_intent_) {
                 playback_->start();
+            }
+            if (playback_->audio_fallback()) {
+                emit_locked(LEGATO_EVENT_TYPE_AUDIO_FALLBACK, event_time_locked(), "{\"clock\":\"monotonic\"}");
             }
             complete_command_locked(job.command_id, true);
             wake = true;
@@ -435,7 +520,7 @@ void Player::media_ended() {
         ended_sent_ = true;
         state_ = LEGATO_STATE_ENDED;
         position_us_.store(duration_us_, std::memory_order_release);
-        const std::int64_t now = monotonic_us();
+        const std::int64_t now = event_time_locked();
         emit_locked(LEGATO_EVENT_TYPE_ENDED, now, "{\"reason\":\"eos\"}");
         emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"ended\"}");
         wake = true;
@@ -518,7 +603,7 @@ void Player::note_stall() {
         ++stall_count_;
         if (state_ == LEGATO_STATE_PLAYING && playing_intent_) {
             state_ = LEGATO_STATE_BUFFERING;
-            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, monotonic_us(), "{\"state\":\"buffering\"}");
+            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, event_time_locked(), "{\"state\":\"buffering\"}");
             wake = true;
         }
     }
@@ -533,30 +618,20 @@ void Player::note_buffer_resumed() {
             return;
         }
         state_ = LEGATO_STATE_PLAYING;
-        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, monotonic_us(), "{\"state\":\"playing\"}");
+        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, event_time_locked(), "{\"state\":\"playing\"}");
         wake = true;
     }
     dispatch(wake);
 }
 
-void Player::update_position_locked() {
-    if (state_ != LEGATO_STATE_PLAYING) {
-        return;
+std::int64_t Player::event_time_locked() const {
+    if (playback_ != nullptr) {
+        return playback_->clock_now_us();
     }
-    const std::int64_t now = engine_->scheduler_.now();
-    std::int64_t pos = media_start_us_ + (now - origin_us_);
-    if (pos >= duration_us_) {
-        pos = duration_us_;
-        state_ = LEGATO_STATE_ENDED;
-        position_us_.store(pos, std::memory_order_release);
-        if (!ended_sent_) {
-            ended_sent_ = true;
-            emit_locked(LEGATO_EVENT_TYPE_ENDED, now, "{\"reason\":\"eos\"}");
-            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, now, "{\"state\":\"ended\"}");
-        }
-        return;
+    if (virtual_session_) {
+        return engine_->virtual_clock().now_us();
     }
-    position_us_.store(pos, std::memory_order_release);
+    return 0;
 }
 
 bool Player::play_locked() {
@@ -580,7 +655,7 @@ bool Player::play_locked() {
         playback_->start();
         if (state_ == LEGATO_STATE_READY) {
             state_ = LEGATO_STATE_PLAYING;
-            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, engine_->scheduler_.now(), "{\"state\":\"playing\"}");
+            emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, event_time_locked(), "{\"state\":\"playing\"}");
             return true;
         }
         return true;
@@ -590,31 +665,34 @@ bool Player::play_locked() {
 
 bool Player::pause_locked() {
     playing_intent_ = false;
-    if (file_mode_ && playback_) {
-        playback_->pause();
-        if (state_ != LEGATO_STATE_PLAYING && state_ != LEGATO_STATE_LOADING) {
-            return false;
-        }
-        state_ = LEGATO_STATE_READY;
-        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, monotonic_us(), "{\"state\":\"ready\"}");
-        return true;
-    }
-    if (state_ != LEGATO_STATE_PLAYING) {
+    if (!file_mode_ || playback_ == nullptr) {
         return false;
     }
-    update_position_locked();
+    playback_->pause();
+    const char* quiet = std::getenv("LEGATO_TEST_QUIET");
+    if (quiet != nullptr && std::strcmp(quiet, "pause") == 0) {
+        arm_quiet_window(200000);
+    }
+    if (state_ != LEGATO_STATE_PLAYING && state_ != LEGATO_STATE_LOADING) {
+        return false;
+    }
     state_ = LEGATO_STATE_READY;
-    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, engine_->scheduler_.now(), "{\"state\":\"ready\"}");
+    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, event_time_locked(), "{\"state\":\"ready\"}");
     return true;
 }
 
 bool Player::seek_locked(std::int64_t position_us, int mode) {
     note_test_seek_mode(mode);
+    open_seek_mode_ = mode;
     if (position_us < 0) {
         position_us = 0;
     }
     if (position_us > duration_us_) {
         position_us = duration_us_;
+    }
+    if (file_mode_ && playback_ && !playback_->session_seekable()) {
+        /* 服务端没有 Range。这次 Seek 失败，会话留在当前状态，不进入 error。 */
+        return false;
     }
     if (file_mode_ && playback_) {
         ++serial_;
@@ -624,7 +702,7 @@ bool Player::seek_locked(std::int64_t position_us, int mode) {
         if (state_ == LEGATO_STATE_ENDED) {
             state_ = LEGATO_STATE_READY;
         }
-        playback_->seek(position_us, static_cast<std::uint32_t>(serial_));
+        playback_->seek_to(position_us, static_cast<std::uint32_t>(serial_), mode);
         segment_media_us_ = position_us;
         segment_virtual_us_ = engine_->virtual_clock().now_us();
         segment_set_ = true;
@@ -637,14 +715,12 @@ bool Player::seek_locked(std::int64_t position_us, int mode) {
         }
         std::snprintf(json, sizeof(json), "{\"position_us\":%lld,\"mode\":\"%s\"}",
                       static_cast<long long>(position_us), mode_name);
-        emit_locked(LEGATO_EVENT_TYPE_SEEK, monotonic_us(), json);
+        emit_locked(LEGATO_EVENT_TYPE_SEEK, event_time_locked(), json);
         return true;
     }
+    /* 打开前没有会话时钟。这里只记下目标，finish_open_job 再补一次 Seek。 */
     ++serial_;
     media_start_us_ = position_us;
-    if (state_ == LEGATO_STATE_PLAYING) {
-        origin_us_ = engine_->scheduler_.now();
-    }
     position_us_.store(position_us, std::memory_order_release);
     const char* mode_name = "precise";
     if (mode == LEGATO_SEEK_MODE_KEYFRAME) {
@@ -655,7 +731,7 @@ bool Player::seek_locked(std::int64_t position_us, int mode) {
     char json[96];
     std::snprintf(json, sizeof(json), "{\"position_us\":%lld,\"mode\":\"%s\"}",
                   static_cast<long long>(position_us), mode_name);
-    emit_locked(LEGATO_EVENT_TYPE_SEEK, engine_->scheduler_.now(), json);
+    emit_locked(LEGATO_EVENT_TYPE_SEEK, event_time_locked(), json);
     return true;
 }
 
@@ -664,14 +740,13 @@ bool Player::stop_locked() {
     if (file_mode_ && playback_) {
         playback_->pause();
         state_ = LEGATO_STATE_IDLE;
-        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, monotonic_us(), "{\"state\":\"idle\"}");
+        emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, event_time_locked(), "{\"state\":\"idle\"}");
         return true;
     }
-    engine_->scheduler_.cancel(id_);
     state_ = LEGATO_STATE_IDLE;
     media_start_us_ = 0;
     position_us_.store(0, std::memory_order_release);
-    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, engine_->scheduler_.now(), "{\"state\":\"idle\"}");
+    emit_locked(LEGATO_EVENT_TYPE_STATE_CHANGED, event_time_locked(), "{\"state\":\"idle\"}");
     return true;
 }
 
@@ -683,6 +758,16 @@ int Player::load_uri(const char* uri, std::uint64_t* command_id) {
         id = bump_locked(command_id);
     }
     engine_->post([this, copy, id] {
+        char scheme[32];
+        SourceRegistration reg{};
+        const SourceRegistration* found = nullptr;
+        /* 先拿 Engine::mu_。下面才拿 Player::mu_，顺序不能反。 */
+        if (scheme_name(copy.c_str(), scheme, sizeof(scheme)) && std::strcmp(scheme, "http") != 0 &&
+            std::strcmp(scheme, "https") != 0 && std::strncmp(copy.c_str(), "corpus:", 7) != 0) {
+            if (engine_->copy_source(scheme, &reg)) {
+                found = &reg;
+            }
+        }
         std::shared_ptr<FilePlayback> old;
         bool wake = false;
         {
@@ -693,7 +778,7 @@ int Player::load_uri(const char* uri, std::uint64_t* command_id) {
             } else {
                 old = std::move(playback_);
                 file_mode_ = false;
-                wake = begin_load_locked(copy.c_str(), id);
+                wake = begin_load_locked(copy.c_str(), id, found);
             }
         }
         old.reset();
@@ -749,26 +834,57 @@ int Player::pause(std::uint64_t* command_id) {
 }
 
 int Player::seek(std::int64_t position_us, int mode, std::uint64_t* command_id) {
-    std::uint64_t id = 0;
+    bool post = false;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        id = bump_locked(command_id);
+        const std::uint64_t id = bump_locked(command_id);
+        /* 控制线程还没取走上一次时，后来的 Seek 只改目标。一次任务执行最新的位置。 */
+        seek_pos_ = position_us;
+        seek_mode_pending_ = mode;
+        seek_ids_.push_back(id);
+        if (!seek_posted_) {
+            seek_posted_ = true;
+            post = true;
+        }
     }
-    engine_->post([this, position_us, mode, id] {
+    if (post) {
+        engine_->post([this] { coalesce_seeks(); });
+    }
+    return LEGATO_ERR_OK;
+}
+
+void Player::coalesce_seeks() {
+    for (;;) {
+        std::vector<std::uint64_t> ids;
+        std::int64_t position_us = 0;
+        int mode = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (seek_ids_.empty()) {
+                seek_posted_ = false;
+                return;
+            }
+            ids.swap(seek_ids_);
+            position_us = seek_pos_;
+            mode = seek_mode_pending_;
+        }
         bool wake = false;
         {
-            std::lock_guard<std::mutex> self_lock(mu_);
+            std::lock_guard<std::mutex> lock(mu_);
             if (ignore_if_released_locked()) {
-                complete_command_locked(id, false);
+                for (const std::uint64_t id : ids) {
+                    complete_command_locked(id, false);
+                }
             } else {
-                seek_locked(position_us, mode);
-                complete_command_locked(id, true);
+                const bool ok = seek_locked(position_us, mode);
+                for (const std::uint64_t id : ids) {
+                    complete_command_locked(id, ok);
+                }
             }
             wake = wake_;
         }
         dispatch(wake);
-    });
-    return LEGATO_ERR_OK;
+    }
 }
 
 int Player::stop(std::uint64_t* command_id) {
@@ -900,6 +1016,8 @@ int Player::observe(const char* property, double min_interval_s, std::uint64_t t
         if (watch.used && std::strcmp(watch.name, property) == 0) {
             watch.min_interval_s = min_interval_s;
             watch.tag = tag;
+            watch.next_due_us = monotonic_us();
+            engine_->poke_observe();
             return LEGATO_ERR_OK;
         }
     }
@@ -908,7 +1026,9 @@ int Player::observe(const char* property, double min_interval_s, std::uint64_t t
             std::snprintf(watch.name, sizeof(watch.name), "%s", property);
             watch.min_interval_s = min_interval_s;
             watch.tag = tag;
+            watch.next_due_us = monotonic_us();
             watch.used = true;
+            engine_->poke_observe();
             return LEGATO_ERR_OK;
         }
     }
@@ -940,8 +1060,26 @@ int Player::read_stats(legato_session_stats* out) {
     out->cache_hit = cache_hit_;
     out->decoder_reused_last = decoder_reused_last_;
     out->events_dropped = events_dropped_;
+    out->audio_clock_source = playback_ != nullptr ? playback_->audio_clock_source() : 0;
+    out->seek_first_pts_us = playback_ != nullptr ? playback_->seek_first_pts_us() : -1;
+    out->seek_stale_frames = playback_ != nullptr ? playback_->seek_stale_frames() : 0;
+    out->seek_commits = playback_ != nullptr ? playback_->seek_commits() : 0;
+    out->dropped_frames = playback_ != nullptr ? playback_->video_dropped() : 0;
+    out->stage_dns_us = stage_dns_us_;
+    out->stage_connect_us = stage_connect_us_;
+    out->stage_tls_us = stage_tls_us_;
+    out->stage_first_byte_us = stage_first_byte_us_;
+    out->source_seekable = source_seekable_;
     std::snprintf(out->presentation_sha256, sizeof(out->presentation_sha256), "%s", presentation_sha256_);
     return LEGATO_ERR_OK;
+}
+
+int Player::copy_av_sync_us(std::int64_t* dst, int capacity) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!playback_) {
+        return 0;
+    }
+    return playback_->copy_av_sync_us(dst, capacity);
 }
 
 int Player::default_seek_mode() const {
@@ -966,6 +1104,36 @@ void Player::prepare_advance(std::int64_t delta_us) {
     if (playback) {
         playback->wait_decoded(target);
     }
+}
+
+std::int64_t Player::claim_observe_delay_us() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (released_) {
+        return -1;
+    }
+    const std::int64_t now = monotonic_us();
+    std::int64_t best = -1;
+    bool any = false;
+    for (Watch& watch : watches_) {
+        if (!watch.used) {
+            continue;
+        }
+        any = true;
+        if (watch.next_due_us == 0 || watch.next_due_us <= now) {
+            const std::int64_t interval = static_cast<std::int64_t>(watch.min_interval_s * 1000000.0);
+            watch.next_due_us = now + (interval > 0 ? interval : 1000000);
+            best = 0;
+        } else if (best != 0) {
+            const std::int64_t delay = watch.next_due_us - now;
+            if (best < 0 || delay < best) {
+                best = delay;
+            }
+        }
+    }
+    if (!any) {
+        return -1;
+    }
+    return best;
 }
 
 void Player::poll_observe() {
@@ -1001,7 +1169,7 @@ void Player::poll_observe() {
             char json[256];
             std::snprintf(json, sizeof(json), "{\"property\":\"%s\",\"tag\":%llu,\"value\":\"%s\"}", watch.name,
                           static_cast<unsigned long long>(watch.tag), text);
-            emit_locked(LEGATO_EVENT_TYPE_PROPERTY_CHANGED, now, json);
+            emit_locked(LEGATO_EVENT_TYPE_PROPERTY_CHANGED, event_time_locked(), json);
             wake = true;
         }
     }
@@ -1029,6 +1197,21 @@ void Player::set_wakeup(void (*callback)(void*), void* userdata) {
     wakeup_ud_ = userdata;
 }
 
+int Player::render_gl(unsigned fbo, int width, int height) {
+    std::shared_ptr<FilePlayback> playback;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (released_ || playback_ == nullptr) {
+            return LEGATO_ERR_UNSUPPORTED;
+        }
+        playback = playback_;
+    }
+    if (playback->render_gl(fbo, width, height) != 0) {
+        return LEGATO_ERR_UNSUPPORTED;
+    }
+    return LEGATO_ERR_OK;
+}
+
 int Player::attach_surface(void* handle) {
     std::lock_guard<std::mutex> lock(mu_);
     if (released_) {
@@ -1051,7 +1234,6 @@ void Player::on_clock_advanced() {
             return;
         }
         if (!virtual_session_ || playback_ == nullptr) {
-            update_position_locked();
             return;
         }
         playback = playback_;

@@ -6,7 +6,6 @@
 #include "legato/engine/media_queue.hpp"
 
 #include <cstdint>
-#include <deque>
 
 namespace legato {
 
@@ -14,14 +13,25 @@ namespace legato {
    drain_main 由取帧线程调用。两条都不拿 Player::mu_。 */
 class VideoPresenter {
 public:
+    VideoPresenter() = default;
+    ~VideoPresenter();
+
     void present_until(FilePlayback* playback, std::int64_t elapsed_us, FilePlayback::PresentUpdate* out);
     void drain_main(FilePlayback* playback);
-    int held_count() const { return static_cast<int>(held_.size()); }
+    int held_count() const { return held_count_; }
 
 private:
     void note_serial(FilePlayback* playback, std::uint32_t serial);
+    void keep_shown(VideoFrame* frame);
+    void clear_held();
+    void pace_audio(FilePlayback* playback);
+    void emit_paced(FilePlayback* playback, VideoFrame* frame);
 
-    std::deque<VideoFrame> held_;
+    /* 固定槽位。稳态里不能再为挑帧分配。 */
+    static constexpr int kHeldMax = 16;
+    VideoFrame held_[kHeldMax]{};
+    int held_count_ = 0;
+    VideoFrame shown_{};
     std::int64_t present_elapsed_us_ = 0;
     bool saw_present_ = false;
     bool present_ended_ = false;

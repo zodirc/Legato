@@ -1,9 +1,10 @@
 #ifndef LEGATO_ENGINE_MEDIA_QUEUE_HPP
 #define LEGATO_ENGINE_MEDIA_QUEUE_HPP
 
+#include "legato/core/object_pool.hpp"
+
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -40,12 +41,19 @@ public:
     std::int64_t span_us() const;
 
 private:
+    static constexpr int kSlotCount = 4096;
+
     void clear_locked();
     bool over_limit_locked() const;
+    const OwnedPacket& front_locked() const;
+    const OwnedPacket& back_locked() const;
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
-    std::deque<OwnedPacket> packets_;
+    ObjectPool<OwnedPacket, kSlotCount> pool_;
+    OwnedPacket* order_[kSlotCount]{};
+    int head_ = 0;
+    int count_ = 0;
     std::int64_t max_span_us_ = 0;
     std::int64_t max_bytes_ = 0;
     std::int64_t bytes_ = 0;
@@ -56,17 +64,41 @@ private:
 };
 
 struct VideoFrame {
+    void* handle = nullptr;
+    const std::uint8_t* data0 = nullptr;
+    int linesize0 = 0;
+    int width = 0;
+    int height = 0;
     std::int64_t pts_us = 0;
-    std::uint64_t content = 0;
     std::uint32_t serial = 0;
+    void (*release)(void*) = nullptr;
 };
 
-/* 视频帧队列，容量 8。单生产者单消费者。serial 变化时清空并唤醒。 */
+inline void release_frame(VideoFrame* frame) {
+    if (frame == nullptr) {
+        return;
+    }
+    if (frame->release != nullptr && frame->handle != nullptr) {
+        frame->release(frame->handle);
+    }
+    *frame = VideoFrame{};
+}
+
+/* 视频帧队列，容量 8。外壳来自对象池，像素是 av_frame_ref。
+   serial 变化时先释放帧再唤醒：像素不属于解码器的下一帧。 */
 class FrameQueue {
 public:
     static constexpr int kCapacity = 8;
 
+    FrameQueue();
+    ~FrameQueue();
+
+    FrameQueue(const FrameQueue&) = delete;
+    FrameQueue& operator=(const FrameQueue&) = delete;
+
+    /* 0 已入队。-1 被拒绝，调用方仍持有 frame。 */
     int push(VideoFrame frame);
+    /* 0 取出，调用方持有像素。-1 当前为空。 */
     int pop(VideoFrame* out);
     void set_serial(std::uint32_t serial);
     void abort();
@@ -74,9 +106,12 @@ public:
     int size() const;
 
 private:
+    void clear_locked();
+
     mutable std::mutex mu_;
     std::condition_variable cv_;
-    VideoFrame frames_[kCapacity]{};
+    ObjectPool<VideoFrame, kCapacity> pool_;
+    VideoFrame* order_[kCapacity]{};
     int head_ = 0;
     int count_ = 0;
     std::uint32_t serial_ = 1;
@@ -86,6 +121,8 @@ private:
 /* PCM 块。音频输出线程只从这里取样本。serial 变化时丢掉旧块并唤醒。 */
 class PcmQueue {
 public:
+    PcmQueue();
+
     int push(const std::int16_t* interleaved, int frames, int channels, std::uint32_t serial);
     int pop(std::int16_t* dst, int max_frames, int channels, std::uint32_t serial);
     void set_serial(std::uint32_t serial);
@@ -94,22 +131,18 @@ public:
     int buffered_frames() const;
 
 private:
-    struct Chunk {
-        std::uint32_t serial = 0;
-        int channels = 0;
-        int frames = 0;
-        int used = 0;
-        std::vector<std::int16_t> samples;
-    };
-
     mutable std::mutex mu_;
     std::condition_variable cv_;
-    std::deque<Chunk> chunks_;
+    /* 构造时按最大声道数预分配。push 只拷贝，不再为每块 PCM 分配。 */
+    std::vector<std::int16_t> samples_;
+    int read_ = 0;
     int buffered_frames_ = 0;
+    int channels_ = 0;
     std::uint32_t serial_ = 1;
     bool abort_ = false;
     /* 只留约 200ms。30ms 的解码延迟靠这段垫住；再大的话包队列见底会被 PCM 盖住。 */
     static constexpr int kMaxFrames = 48000 / 5;
+    static constexpr int kMaxChannels = 8;
 };
 
 }  /* namespace legato */

@@ -103,6 +103,16 @@ int main(void) {
     CHECK(legato_engine_advance_us(engine, 1000000) == 0);
     CHECK(legato_player_position_us(player) == 11120000);
 
+    /* get 会复制一份 JSON。稳态计数先在这里读，免得把这份复制算进去。 */
+    legato_session_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.struct_size = (uint32_t)sizeof(stats);
+    CHECK(legato_player_read_stats(player, &stats) == 0);
+    CHECK(stats.first_frame_us == 16667);
+    CHECK(stats.alloc_steady == 0);
+    CHECK(stats.stall_count == 0);
+    CHECK(stats.presented == 34);
+
     char* state = NULL;
     CHECK(legato_player_get(player, "state", &state) == 0);
     CHECK(state != NULL && strcmp(state, "\"playing\"") == 0);
@@ -112,15 +122,6 @@ int main(void) {
     CHECK(legato_player_get(player, "video.output_path", &path) == 0);
     CHECK(path != NULL && strcmp(path, "\"record\"") == 0);
     legato_free(path);
-
-    legato_session_stats stats;
-    memset(&stats, 0, sizeof(stats));
-    stats.struct_size = (uint32_t)sizeof(stats);
-    CHECK(legato_player_read_stats(player, &stats) == 0);
-    CHECK(stats.first_frame_us == 16667);
-    CHECK(stats.alloc_steady == 0);
-    CHECK(stats.stall_count == 0);
-    CHECK(stats.presented == 34);
 
     /* The coalesced seek was drained above. Load and the first frame are still queued. */
     CHECK(count_events(player, LEGATO_EVENT_TYPE_FIRST_FRAME) == 1);

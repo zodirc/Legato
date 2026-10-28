@@ -1,5 +1,6 @@
 #include "legato/demux/ffmpeg_demuxer.hpp"
 
+#include "legato/core/alloc.hpp"
 #include "legato/io/data_source.hpp"
 
 extern "C" {
@@ -148,6 +149,7 @@ void FFmpegDemuxer::discard_video() {
 }
 
 int FFmpegDemuxer::read_packet(PacketView* out) {
+    AllocExempt exempt;
     if (out == nullptr || fmt_ == nullptr || packet_ == nullptr) {
         return -1;
     }
@@ -192,6 +194,7 @@ int FFmpegDemuxer::read_packet(PacketView* out) {
 }
 
 int FFmpegDemuxer::take_packet(PacketView* out, void** owned) {
+    AllocExempt exempt;
     if (owned == nullptr) {
         return -1;
     }
@@ -220,6 +223,7 @@ void release_owned_packet(void* owned) {
 }
 
 void FFmpegDemuxer::flush(std::uint32_t serial) {
+    AllocExempt exempt;
     serial_ = serial;
     if (packet_ != nullptr) {
         av_packet_unref(static_cast<AVPacket*>(packet_));
@@ -227,6 +231,7 @@ void FFmpegDemuxer::flush(std::uint32_t serial) {
 }
 
 int FFmpegDemuxer::seek_us(std::int64_t pts_us) {
+    AllocExempt exempt;
     if (fmt_ == nullptr) {
         return -1;
     }

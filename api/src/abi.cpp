@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string>
 
 namespace {
 
@@ -156,8 +157,16 @@ uint64_t legato_player_command(legato_player* player, const char* command_json) 
     }
     std::uint64_t id = 0;
     if (std::strcmp(cmd, LEGATO_CMD_LOAD) == 0) {
-        char uri[1024];
+        char uri[LEGATO_URI_MAX];
         uri[0] = '\0';
+        const char* begin = nullptr;
+        const char* end = nullptr;
+        if (legato::json_find_value(command_json, "uri", &begin, &end) &&
+            static_cast<std::size_t>(end - begin) >= LEGATO_URI_MAX) {
+            std::string too_long(LEGATO_URI_MAX, 'x');
+            held->load_uri(too_long.c_str(), &id);
+            return id;
+        }
         legato::json_copy_string(command_json, "uri", uri, sizeof(uri));
         held->load_uri(uri, &id);
         return id;
@@ -295,6 +304,14 @@ int legato_player_read_stats(legato_player* player, legato_session_stats* out) {
     return held->read_stats(out);
 }
 
+int legato_player_copy_av_sync_us(legato_player* player, int64_t* dst, int capacity) {
+    std::shared_ptr<legato::Player> held = lock_player(player_shell(player));
+    if (!held) {
+        return 0;
+    }
+    return held->copy_av_sync_us(dst, capacity);
+}
+
 void legato_player_set_wakeup(legato_player* player, void (*callback)(void*), void* userdata) {
     std::shared_ptr<legato::Player> held = lock_player(player_shell(player));
     if (!held) {
@@ -322,12 +339,35 @@ int legato_player_attach_surface(legato_player* player, const legato_surface* su
     return held->attach_surface(surface->handle);
 }
 
-legato_render_ctx* legato_render_create(legato_player* /*player*/, const legato_render_params* /*params*/) {
-    return nullptr;
+struct RenderCtx {
+    std::shared_ptr<legato::Player> player;
+};
+
+legato_render_ctx* legato_render_create(legato_player* player, const legato_render_params* params) {
+    if (params == nullptr || params->struct_size < sizeof(uint32_t) || params->api != LEGATO_RENDER_API_GL) {
+        return nullptr;
+    }
+    std::shared_ptr<legato::Player> held = lock_player(player_shell(player));
+    if (!held) {
+        return nullptr;
+    }
+    auto* ctx = new (std::nothrow) RenderCtx;
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    ctx->player = std::move(held);
+    return reinterpret_cast<legato_render_ctx*>(ctx);
 }
 
-int legato_render_frame(legato_render_ctx* /*ctx*/, const legato_render_target* /*target*/) {
-    return LEGATO_ERR_UNSUPPORTED;
+int legato_render_frame(legato_render_ctx* ctx, const legato_render_target* target) {
+    if (ctx == nullptr || target == nullptr) {
+        return LEGATO_ERR_UNSUPPORTED;
+    }
+    if (target->struct_size < sizeof(uint32_t) || target->width <= 0 || target->height <= 0) {
+        return LEGATO_ERR_INVALID_ARGUMENT;
+    }
+    auto* render = reinterpret_cast<RenderCtx*>(ctx);
+    return render->player->render_gl(target->gl_fbo, target->width, target->height);
 }
 
 int legato_register_source(legato_engine* engine, const char* scheme, const legato_source_vtable* vtable,
