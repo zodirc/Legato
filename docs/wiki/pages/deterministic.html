@@ -3,9 +3,9 @@
     <h2>确定性回归</h2>
     <p class="lede"><code>corpus://</code> 的根目录来自 <code>legato_engine_create</code> 的 <code>corpus_root</code>。先核对 <code>testdata/corpus.yaml</code> 的内容哈希，再经 <code>FileSource</code> 进入 <code>FilePlayback</code>。解复用线程把包放进每路队列。该路径不打开 ALSA PCM 设备。<code>Player::io_main</code> 注入 <code>VirtualClock</code>、<code>NullAudioSink</code> 和 <code>RecordingVideoSink</code>。挑帧在 <code>VideoPresenter::present_until</code>。</p>
     <h3>1. 虚拟媒体时钟</h3>
-    <p><code>begin_load_locked</code> 将 <code>state</code> 置为 <code>loading</code>，并把打开交给会话 IO 线程。时钟只在 <code>legato_engine_advance_us</code> 被调用时前进，内部按 16667 微秒的垂直同步量化。<code>NullAudioSink::write_frames</code> 消费 PCM，样本位置经 <code>AudioMasterClock::observe_delay</code> 计算。第一帧在第一次同步呈现，<code>first_frame.us</code> 为 16667，与解码耗时无关。</p>
+    <p><code>begin_load_locked</code> 将 <code>state</code> 置为 <code>loading</code>，并把打开交给会话 IO 线程。时钟只在 <code>legato_engine_advance_us</code> 被调用时前进，内部按 16667 微秒的垂直同步量化。<code>NullAudioSink::write_frames</code> 消费 PCM，样本位置经 <code>AudioMasterClock::observe_delay</code> 计算。第一帧在第一次同步呈现，<code>first_frame.us</code> 为 16667，与解码耗时无关。帧是 <code>AVFrame</code> 引用，指纹在 <code>present_until</code> 计算。视频取帧线程不取这条路径上的帧。这一拍的 PCM 或帧还没到时，控制线程在条件变量上等待，最多 200 毫秒。队列见底则记一次停顿。</p>
     <h3>2. 基线</h3>
-    <p><code>legato-bench</code> 将结果与 <code>bench/golden/</code> 比对。结果字段 <code>model</code> 的字面量是 <code>pipeline</code>。基线含呈现 PTS 序列哈希 <code>presentation_sha256</code>。进入稳态后 <code>alloc_steady</code> 的门禁为 0，只统计 <code>tracked_malloc</code>。丢掉一帧时 T1 必须失败。</p>
+    <p><code>legato-bench</code> 将结果与 <code>bench/golden/</code> 比对。结果字段 <code>model</code> 的字面量是 <code>pipeline</code>。基线含呈现 PTS 序列哈希 <code>presentation_sha256</code>。进入稳态后 <code>alloc_steady</code> 的门禁为 0，计数覆盖 <code>liblegato</code> 链接时 <code>--wrap</code> 的 <code>malloc</code>、<code>calloc</code>、<code>realloc</code>、<code>posix_memalign</code>，含静态链入的 FFmpeg。解复用和解码的豁免调用点写在 <code>idl/metrics.yaml</code>。<code>RecordingVideoSink</code> 每次呈现记一个 <code>|视频 PTS - 音频时钟|</code> 样本，基线写 p50、p95 和最大值。虚拟媒体时钟上没有意义的首帧拆解段写 <code>null</code>。丢掉一帧时 T1 必须失败。</p>
     <p class="src"><code>resolve_corpus</code> · <code>NullAudioSink</code> · <code>RecordingVideoSink</code> · <code>bench/golden/</code></p>
   </div>
   <figure class="figure">
