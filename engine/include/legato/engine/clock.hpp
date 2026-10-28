@@ -31,17 +31,29 @@ public:
     std::int64_t now_us() const override;
 };
 
-/* 音频主时钟。位置只在 observe_delay 里计算。
-   硬件时间戳接口留在这里，阶段 B 再换成 snd_pcm_htimestamp。 */
+/* 音频主时钟。0 还没有采样，1 是硬件时间戳外推，2 是 delay。 */
+enum AudioClockSource {
+    kAudioClockNone = 0,
+    kAudioClockHtimestamp = 1,
+    kAudioClockDelay = 2
+};
+
+/* 位置在 observe_snapshot 或 observe_delay 里计算。
+   硬件时间戳倒退，或和现在相差超过 500 毫秒时，退回 delay。部分驱动和 plughw 的时间戳不能外推。 */
 class AudioMasterClock : public Clock {
 public:
     void reset(std::int64_t origin_us);
     void observe_delay(std::int64_t written_frames, std::int64_t delay_frames, int sample_rate);
+    void observe_snapshot(std::int64_t written_frames, std::int64_t delay_frames, int sample_rate,
+                          std::int64_t tstamp_us, std::int64_t now_us, bool have_tstamp);
     std::int64_t now_us() const override { return position_us_; }
+    int source() const { return source_.load(std::memory_order_acquire); }
 
 private:
     std::int64_t origin_us_ = 0;
     std::int64_t position_us_ = 0;
+    std::int64_t last_tstamp_us_ = -1;
+    std::atomic<int> source_{kAudioClockNone};
 };
 
 }  /* namespace legato */

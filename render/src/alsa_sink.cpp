@@ -5,11 +5,13 @@
 
 #include <cerrno>
 #include <cstring>
+#include <ctime>
 
 /* The machine has the ALSA runtime library but not the development headers. */
 extern "C" {
 typedef struct _snd_pcm snd_pcm_t;
 typedef struct _snd_pcm_hw_params snd_pcm_hw_params_t;
+typedef struct _snd_pcm_status snd_pcm_status_t;
 typedef long snd_pcm_sframes_t;
 typedef unsigned long snd_pcm_uframes_t;
 
@@ -28,11 +30,18 @@ int snd_pcm_hw_params_set_access(snd_pcm_t* pcm, snd_pcm_hw_params_t* params, in
 int snd_pcm_hw_params_set_format(snd_pcm_t* pcm, snd_pcm_hw_params_t* params, int format);
 int snd_pcm_hw_params_set_channels(snd_pcm_t* pcm, snd_pcm_hw_params_t* params, unsigned int val);
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t* pcm, snd_pcm_hw_params_t* params, unsigned int* val, int* dir);
+int snd_pcm_hw_params_set_buffer_time_near(snd_pcm_t* pcm, snd_pcm_hw_params_t* params, unsigned int* val, int* dir);
+int snd_pcm_hw_params_set_period_time_near(snd_pcm_t* pcm, snd_pcm_hw_params_t* params, unsigned int* val, int* dir);
 int snd_pcm_hw_params(snd_pcm_t* pcm, snd_pcm_hw_params_t* params);
 int snd_pcm_prepare(snd_pcm_t* pcm);
 int snd_pcm_drop(snd_pcm_t* pcm);
 int snd_pcm_drain(snd_pcm_t* pcm);
 int snd_pcm_delay(snd_pcm_t* pcm, snd_pcm_sframes_t* delay);
+int snd_pcm_status_malloc(snd_pcm_status_t** ptr);
+void snd_pcm_status_free(snd_pcm_status_t* obj);
+int snd_pcm_status(snd_pcm_t* pcm, snd_pcm_status_t* status);
+snd_pcm_sframes_t snd_pcm_status_get_delay(const snd_pcm_status_t* obj);
+void snd_pcm_status_get_htstamp(const snd_pcm_status_t* obj, timespec* ptr);
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t* pcm, const void* buffer, snd_pcm_uframes_t size);
 int snd_pcm_recover(snd_pcm_t* pcm, int err, int silent);
 const char* snd_strerror(int err);
@@ -52,6 +61,15 @@ bool configure(snd_pcm_t* pcm, unsigned int* rate, unsigned int channels) {
               snd_pcm_hw_params_set_channels(pcm, params, channels) >= 0;
     int dir = 0;
     ok = ok && snd_pcm_hw_params_set_rate_near(pcm, params, rate, &dir) >= 0;
+    /* 100 ms 缓冲、20 ms 周期让延迟和欠载间隔不跟着驱动缺省走。设备拒绝时保留驱动自己的值，打开不因此失败。 */
+    if (ok) {
+        unsigned int buffer_us = 100000;
+        dir = 0;
+        snd_pcm_hw_params_set_buffer_time_near(pcm, params, &buffer_us, &dir);
+        unsigned int period_us = 20000;
+        dir = 0;
+        snd_pcm_hw_params_set_period_time_near(pcm, params, &period_us, &dir);
+    }
     ok = ok && snd_pcm_hw_params(pcm, params) >= 0;
     snd_pcm_hw_params_free(params);
     return ok && snd_pcm_prepare(pcm) >= 0;
@@ -63,7 +81,7 @@ AlsaSink::~AlsaSink() { close(); }
 
 int AlsaSink::open(int sample_rate, int channels) {
     close();
-    if (sample_rate <= 0 || channels <= 0) {
+    if (test_no_audio_device() || sample_rate <= 0 || channels <= 0) {
         return -1;
     }
     const char* devices[] = {"default", "plughw:0,0", "hw:0,0"};
@@ -79,7 +97,13 @@ int AlsaSink::open(int sample_rate, int channels) {
             snd_pcm_close(pcm);
             continue;
         }
+        snd_pcm_status_t* status = nullptr;
+        if (snd_pcm_status_malloc(&status) < 0) {
+            snd_pcm_close(pcm);
+            continue;
+        }
         pcm_ = pcm;
+        status_ = status;
         rate_ = static_cast<int>(opened_rate);
         channels_ = channels;
         interrupted_.store(false);
@@ -93,6 +117,10 @@ int AlsaSink::open(int sample_rate, int channels) {
 void AlsaSink::present(std::int64_t pts_us) { (void)pts_us; }
 
 void AlsaSink::close() {
+    if (status_ != nullptr) {
+        snd_pcm_status_free(static_cast<snd_pcm_status_t*>(status_));
+        status_ = nullptr;
+    }
     if (pcm_ != nullptr) {
         snd_pcm_close(static_cast<snd_pcm_t*>(pcm_));
         pcm_ = nullptr;
@@ -147,15 +175,34 @@ void AlsaSink::drain() {
     }
 }
 
-int AlsaSink::delay_frames() const {
+int AlsaSink::delay_frames() const { return delay_snapshot().frames; }
+
+DelaySnapshot AlsaSink::delay_snapshot() const {
+    DelaySnapshot snap;
     if (pcm_ == nullptr) {
-        return 0;
+        return snap;
     }
-    snd_pcm_sframes_t delay = 0;
-    if (snd_pcm_delay(static_cast<snd_pcm_t*>(pcm_), &delay) < 0 || delay < 0) {
-        return 0;
+    auto* pcm = static_cast<snd_pcm_t*>(pcm_);
+    auto* status = static_cast<snd_pcm_status_t*>(status_);
+    /* snd_pcm_htimestamp 只返回可用帧数。delay 和时间戳要同一次 status，否则外推用的不是同一时刻。 */
+    if (status == nullptr || snd_pcm_status(pcm, status) < 0) {
+        snd_pcm_sframes_t delay = 0;
+        if (snd_pcm_delay(pcm, &delay) >= 0 && delay > 0) {
+            snap.frames = static_cast<int>(delay);
+        }
+        return snap;
     }
-    return static_cast<int>(delay);
+    const snd_pcm_sframes_t delay = snd_pcm_status_get_delay(status);
+    if (delay > 0) {
+        snap.frames = static_cast<int>(delay);
+    }
+    timespec ts{};
+    snd_pcm_status_get_htstamp(status, &ts);
+    if (ts.tv_sec > 0 || ts.tv_nsec > 0) {
+        snap.tstamp_us = static_cast<std::int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+        snap.have_tstamp = snap.tstamp_us > 0;
+    }
+    return snap;
 }
 
 }  /* namespace legato */

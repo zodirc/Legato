@@ -21,11 +21,14 @@ public:
     void end_interrupt() override;
     void drain() override;
     int delay_frames() const override;
+    DelaySnapshot delay_snapshot() const override;
     int rate() const override { return rate_; }
     int channels() const override { return channels_; }
 
 private:
     void* pcm_ = nullptr;
+    /* open 时分配，输出线程反复查询时复用，避免稳态分配。 */
+    void* status_ = nullptr;
     int rate_ = 0;
     int channels_ = 0;
     std::atomic<bool> interrupted_{false};

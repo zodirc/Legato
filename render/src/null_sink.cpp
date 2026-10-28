@@ -70,6 +70,44 @@ void NullAudioSink::end_interrupt() {}
 
 int NullAudioSink::delay_frames() const { return 0; }
 
+int FallbackAudioSink::open(int sample_rate, int channels) {
+    rate_ = sample_rate > 0 ? sample_rate : 48000;
+    channels_ = channels > 0 ? channels : 2;
+    interrupted_.store(false);
+    return 0;
+}
+
+void FallbackAudioSink::present(std::int64_t /*pts_us*/) {}
+
+void FallbackAudioSink::close() {}
+
+int FallbackAudioSink::write_frames(const std::int16_t* /*interleaved*/, int frames) {
+    if (frames <= 0 || rate_ <= 0) {
+        return -1;
+    }
+    if (interrupted_.load()) {
+        return 0;
+    }
+    std::int64_t left = static_cast<std::int64_t>(frames) * 1000000 / rate_;
+    while (left > 0) {
+        if (interrupted_.load()) {
+            return 0;
+        }
+        const std::int64_t slice = left > 10000 ? 10000 : left;
+        std::this_thread::sleep_for(std::chrono::microseconds(slice));
+        left -= slice;
+    }
+    return interrupted_.load() ? 0 : frames;
+}
+
+void FallbackAudioSink::drop() { interrupted_.store(true); }
+
+void FallbackAudioSink::drain() {}
+
+void FallbackAudioSink::end_interrupt() { interrupted_.store(false); }
+
+int FallbackAudioSink::delay_frames() const { return 0; }
+
 void NullAudioSink::reset() { consumed_ = 0; }
 
 std::int64_t NullAudioSink::consume(int samples) {
@@ -115,9 +153,25 @@ void RecordingVideoSink::record(std::int64_t pts_us, std::uint64_t content, std:
     started_ = true;
     ++presented_;
     const std::int64_t sync = pts_us - (origin_us + audio_clock_us);
-    if (sync > worst_sync_us_ || -sync > worst_sync_us_) {
-        worst_sync_us_ = sync;
+    const std::int64_t magnitude = sync < 0 ? -sync : sync;
+    if (sync_count_ < kMaxSyncSamples) {
+        sync_us_[sync_count_++] = magnitude;
     }
+    if (magnitude > worst_sync_us_) {
+        worst_sync_us_ = magnitude;
+    }
+}
+
+int RecordingVideoSink::copy_av_sync_us(std::int64_t* dst, int capacity) const {
+    const int count = sync_count_;
+    if (dst == nullptr || capacity <= 0) {
+        return count;
+    }
+    const int take = count < capacity ? count : capacity;
+    for (int i = 0; i < take; ++i) {
+        dst[i] = sync_us_[i];
+    }
+    return count;
 }
 
 bool RecordingVideoSink::copy_hash(char* out, std::size_t out_len) const {
