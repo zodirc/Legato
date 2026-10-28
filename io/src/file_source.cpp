@@ -1,5 +1,7 @@
 #include "legato/io/file_source.hpp"
 
+#include "legato/legato_idl.h"
+
 #include <cstdint>
 #include <cstring>
 
@@ -15,8 +17,8 @@ std::int64_t file_tell(FILE* file) { return _ftelli64(file); }
 
 /* CRT 的 fopen 按 ANSI 代码页解释路径。C ABI 传入的是 UTF-8，这里转成 UTF-16。 */
 FILE* open_utf8(const char* path) {
-    wchar_t wide[4096];
-    const int wrote = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, 4096);
+    wchar_t wide[LEGATO_URI_MAX];
+    const int wrote = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, LEGATO_URI_MAX);
     if (wrote <= 0) {
         return nullptr;
     }
@@ -42,6 +44,8 @@ FileSource::~FileSource() {
         std::fclose(file_);
     }
 }
+
+int FileSource::open_io() { return open_file(); }
 
 int FileSource::open_file() {
     if (path_.empty()) {

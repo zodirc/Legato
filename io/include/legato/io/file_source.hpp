@@ -13,6 +13,7 @@ public:
     explicit FileSource(const char* path);
     ~FileSource() override;
 
+    int open_io() override;
     int open_file();
     int read(std::uint8_t* dst, int size) override;
     bool seekable() const override { return file_ != nullptr; }
