@@ -36,6 +36,11 @@ private:
     std::thread thread_;
 };
 
+/* 测试在暂停后的静默窗口里数唤醒。窗口之外的调用不计。 */
+void note_thread_wake();
+void arm_quiet_window(std::int64_t delay_us);
+std::uint64_t quiet_wake_count();
+
 }  /* namespace legato */
 
 #endif
