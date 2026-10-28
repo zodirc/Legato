@@ -4,12 +4,12 @@
 namespace legato {
 
 const PresetDesc kPresets[] = {
-    {"vod", 1.5, 3, 50, 0, true, 0, 0, true},
-    {"short_video", 0.3, 1.0, 15, 0, false, 2, 1, true},
-    {"live", 1.5, 1.5, 8, 3, false, 0, 0, true},
-    {"live_low_latency", 0.5, 0.5, 2, 1, false, 0, 0, true},
-    {"music", 1.5, 3, 50, 0, true, 1, 0, false},
-    {"realtime", 0.15, 0.15, 0.4, 0, false, 0, 0, false},
+    {"vod", 1.5, 3, 50, 0, true, 0, 0, true, true},
+    {"short_video", 0.3, 1.0, 15, 0, false, 2, 1, true, true},
+    {"live", 1.5, 1.5, 8, 3, false, 0, 0, true, true},
+    {"live_low_latency", 0.5, 0.5, 2, 1, false, 0, 0, true, true},
+    {"music", 1.5, 3, 50, 0, true, 1, 0, false, false},
+    {"realtime", 0.15, 0.15, 0.4, 0, false, 0, 0, false, false},
 };
 
 const int kPresetCount = 6;

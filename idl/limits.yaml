@@ -1,0 +1,4 @@
+# Buffer sizes shared by the ABI and the engine. The value includes the terminating NUL.
+limits:
+  - name: LEGATO_URI_MAX
+    value: 4096

@@ -6,3 +6,4 @@ events:
   - name: metrics
   - name: seek
   - name: decoder_fallback
+  - name: audio_fallback

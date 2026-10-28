@@ -13,7 +13,7 @@ errors:
     code: -2
     category: policy
     retryable: false
-    hint: "当前支持的 scheme 是 file 和 corpus。"
+    hint: "当前支持的 scheme 是 file、corpus、http、https，以及 legato_register_source 登记的名字。"
   - name: source_open_failed
     code: -3
     category: source
@@ -23,7 +23,7 @@ errors:
     code: -4
     category: source
     retryable: false
-    hint: "当前支持的 scheme 是 file 和 corpus。"
+    hint: "当前支持的 scheme 是 file、corpus、http、https，以及 legato_register_source 登记的名字。"
   - name: demux_failed
     code: -5
     category: demux

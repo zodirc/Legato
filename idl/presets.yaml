@@ -17,6 +17,8 @@ fields:
     read_by: pending
   - name: video
     read_by: FilePlayback::open
+  - name: audio_fallback
+    read_by: FilePlayback::open
 presets:
   - name: vod
     buffer_start_s: 1.5
@@ -27,6 +29,7 @@ presets:
     preload_ahead: 0
     preload_behind: 0
     video: true
+    audio_fallback: true
   - name: short_video
     buffer_start_s: 0.3
     buffer_resume_s: 1.0
@@ -36,6 +39,7 @@ presets:
     preload_ahead: 2
     preload_behind: 1
     video: true
+    audio_fallback: true
   - name: live
     buffer_start_s: 1.5
     buffer_resume_s: 1.5
@@ -45,6 +49,7 @@ presets:
     preload_ahead: 0
     preload_behind: 0
     video: true
+    audio_fallback: true
   - name: live_low_latency
     buffer_start_s: 0.5
     buffer_resume_s: 0.5
@@ -54,6 +59,7 @@ presets:
     preload_ahead: 0
     preload_behind: 0
     video: true
+    audio_fallback: true
   - name: music
     buffer_start_s: 1.5
     buffer_resume_s: 3
@@ -63,6 +69,7 @@ presets:
     preload_ahead: 1
     preload_behind: 0
     video: false
+    audio_fallback: false
   - name: realtime
     buffer_start_s: 0.15
     buffer_resume_s: 0.15
@@ -72,3 +79,4 @@ presets:
     preload_ahead: 0
     preload_behind: 0
     video: false
+    audio_fallback: false

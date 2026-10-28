@@ -15,6 +15,7 @@ struct PresetDesc {
     int preload_ahead;
     int preload_behind;
     bool video;
+    bool audio_fallback;
 };
 
 extern const PresetDesc kPresets[];

@@ -6,6 +6,8 @@
 
 #define LEGATO_ABI_VERSION 1u
 
+#define LEGATO_URI_MAX 4096
+
 typedef enum legato_state {
     LEGATO_STATE_IDLE = 0,
     LEGATO_STATE_LOADING = 1,
@@ -55,6 +57,7 @@ typedef enum legato_event_type {
     LEGATO_EVENT_TYPE_DECODER_FALLBACK = 7,
     LEGATO_EVENT_TYPE_COMMAND_DONE = 8,
     LEGATO_EVENT_TYPE_PROPERTY_CHANGED = 9,
+    LEGATO_EVENT_TYPE_AUDIO_FALLBACK = 10,
 } legato_event_type;
 
 static inline const char* legato_event_type_name(int value) {
@@ -69,6 +72,7 @@ static inline const char* legato_event_type_name(int value) {
     case LEGATO_EVENT_TYPE_DECODER_FALLBACK: return "decoder_fallback";
     case LEGATO_EVENT_TYPE_COMMAND_DONE: return "command_done";
     case LEGATO_EVENT_TYPE_PROPERTY_CHANGED: return "property_changed";
+    case LEGATO_EVENT_TYPE_AUDIO_FALLBACK: return "audio_fallback";
     default: return "unknown";
     }
 }

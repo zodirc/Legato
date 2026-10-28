@@ -5,6 +5,6 @@ enums:
   - name: seek_mode
     values: precise, keyframe, nearest
   - name: event_type
-    values: none, state_changed, first_frame, ended, error, metrics, seek, decoder_fallback, command_done, property_changed
+    values: none, state_changed, first_frame, ended, error, metrics, seek, decoder_fallback, command_done, property_changed, audio_fallback
   - name: render_api
     values: none, gl, metal, d3d11, vulkan

@@ -6,9 +6,9 @@ namespace legato {
 const ErrorInfo kErrors[] = {
     {"ok", 0, "internal", false, ""},
     {"invalid_argument", -1, "policy", false, "检查调用参数。字符串不能为空；公开结构体的 struct_size 必须是调用方编译时的 sizeof。"},
-    {"unsupported", -2, "policy", false, "当前支持的 scheme 是 file 和 corpus。"},
+    {"unsupported", -2, "policy", false, "当前支持的 scheme 是 file、corpus、http、https，以及 legato_register_source 登记的名字。"},
     {"source_open_failed", -3, "source", false, "确认路径存在，并且进程有读权限。corpus:// 还要核对 testdata/corpus.yaml 里的内容哈希。"},
-    {"unsupported_scheme", -4, "source", false, "当前支持的 scheme 是 file 和 corpus。"},
+    {"unsupported_scheme", -4, "source", false, "当前支持的 scheme 是 file、corpus、http、https，以及 legato_register_source 登记的名字。"},
     {"demux_failed", -5, "demux", false, "容器无法识别，或读取中途失败。确认文件完整。"},
     {"seek_failed", -6, "demux", false, "这个源不能定位，或目标超出时长。"},
     {"decode_failed", -7, "decode", false, "解码器打不开，或这一帧无法解出。"},

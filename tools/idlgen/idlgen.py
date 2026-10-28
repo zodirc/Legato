@@ -154,7 +154,7 @@ def as_list(node):
 
 def load_dir(idl_dir):
     docs = {}
-    for name in ("enums", "properties", "commands", "events", "errors", "metrics", "presets"):
+    for name in ("enums", "properties", "commands", "events", "errors", "metrics", "presets", "limits"):
         path = os.path.join(idl_dir, name + ".yaml")
         with open(path, "r", encoding="utf-8") as handle:
             docs[name] = as_map(parse_yaml(handle.read())[0])
@@ -189,6 +189,10 @@ def emit_header(docs):
     out.append("#include <stdint.h>")
     out.append("")
     out.append("#define LEGATO_ABI_VERSION 1u")
+    out.append("")
+    for item in as_list(docs["limits"]["limits"]):
+        limit = as_map(item)
+        out.append("#define %s %s" % (limit["name"], limit["value"]))
     out.append("")
 
     for item in as_list(docs["enums"]["enums"]):
@@ -248,7 +252,7 @@ def emit_presets(docs):
     presets = [as_map(item) for item in as_list(docs["presets"]["presets"])]
     out.append("const PresetDesc kPresets[] = {")
     for preset in presets:
-        out.append("    {%s, %s, %s, %s, %s, %s, %s, %s, %s}," % (
+        out.append("    {%s, %s, %s, %s, %s, %s, %s, %s, %s, %s}," % (
             c_string(preset["name"]),
             preset["buffer_start_s"],
             preset["buffer_resume_s"],
@@ -258,6 +262,7 @@ def emit_presets(docs):
             preset["preload_ahead"],
             preset["preload_behind"],
             bool_value(preset["video"]),
+            bool_value(preset["audio_fallback"]),
         ))
     out.append("};")
     out.append("")
@@ -282,6 +287,16 @@ def emit_presets(docs):
     out.append("}  /* namespace legato */")
     out.append("")
     return "\n".join(out)
+
+
+def check_metrics(docs):
+    for item in as_list(docs["metrics"]["metrics"]):
+        metric = as_map(item)
+        if "gate" not in metric:
+            continue
+        name = metric.get("name", "?")
+        if not metric.get("scope") or not metric.get("counterexample"):
+            raise SystemExit("metric %s has a gate but is missing scope or counterexample" % name)
 
 
 def check_preset_fields(docs):
@@ -356,6 +371,7 @@ def write_file(path, contents):
 def generate(idl_dir, root):
     docs = load_dir(idl_dir)
     check_preset_fields(docs)
+    check_metrics(docs)
     outputs = {
         os.path.join(root, "include", "legato", "legato_idl.h"): emit_header(docs),
         os.path.join(root, "engine", "src", "presets.gen.cpp"): emit_presets(docs),
@@ -369,6 +385,7 @@ def generate(idl_dir, root):
 def check(idl_dir, root):
     docs = load_dir(idl_dir)
     check_preset_fields(docs)
+    check_metrics(docs)
     expected = {
         os.path.join(root, "include", "legato", "legato_idl.h"): emit_header(docs),
         os.path.join(root, "engine", "src", "presets.gen.cpp"): emit_presets(docs),

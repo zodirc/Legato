@@ -9,9 +9,23 @@ metrics:
   - name: av_sync_ms
     unit: ms
     gate: p95_lt_40
+    scope: "RecordingVideoSink 每次呈现记下的 |视频 PTS - 音频时钟|。legato-bench 用这些样本求 p50、p95 和最大值。"
+    counterexample: t1_av_sync_offset
   - name: alloc_steady
     unit: count
     gate: eq_0
+    scope: "liblegato 链接时 --wrap=malloc、--wrap=calloc、--wrap=realloc、--wrap=posix_memalign 覆盖的分配，含静态链入的 FFmpeg。豁免见 exempt。"
+    counterexample: t1_alloc_pcm
+    exempt:
+      - FFmpegDemuxer::read_packet
+      - FFmpegDemuxer::take_packet
+      - FFmpegDemuxer::seek_us
+      - FFmpegDemuxer::flush
+      - FFmpegSwDecoder::decode
+      - FFmpegSwDecoder::receive
+      - FFmpegSwDecoder::pull_delayed
+      - FFmpegSwDecoder::flush
+      - release_av_frame
   - name: decoder_reuse_rate
     unit: ratio
   - name: dropped_frames
