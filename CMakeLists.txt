@@ -246,6 +246,13 @@ add_test(NAME ffmpeg_import
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ffmpeg_import.py)
 add_test(NAME symbols
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_symbols.sh $<TARGET_FILE:legato>)
+add_test(NAME symbols_dumpbin
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_symbols.sh --from-dumpbin
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dumpbin_ok.txt)
+add_test(NAME symbols_dumpbin_extra
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_symbols.sh --from-dumpbin
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dumpbin_extra.txt)
+set_tests_properties(symbols_dumpbin_extra PROPERTIES WILL_FAIL TRUE)
 add_test(NAME synthetic_dry_run
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/testdata/generate_synthetic.py --dry-run)
 add_test(NAME synthetic_corpus_flags

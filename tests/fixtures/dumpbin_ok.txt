@@ -1,0 +1,21 @@
+Dump of file legato.dll
+
+File Type: DLL
+
+  Section contains the following exports for legato.dll
+
+    00000000 characteristics
+           0 time date stamp
+        0.00 version
+           1 ordinal base
+          2 number of functions
+          2 number of names
+
+    ordinal hint RVA      name
+
+          1    0 00001234 legato_abi_version
+          2    1 00001500 legato_player_load
+
+  Summary
+
+        1000 .text
