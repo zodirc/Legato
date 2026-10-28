@@ -70,6 +70,28 @@ if(EXISTS "${LEGATO_FFMPEG_PREFIX}/lib/avformat.lib")
   set(LEGATO_SWSCALE "${LEGATO_FFMPEG_PREFIX}/lib/swscale.lib")
   set(LEGATO_AVUTIL "${LEGATO_FFMPEG_PREFIX}/lib/avutil.lib")
 endif()
+if(LEGATO_HAS_FFMPEG)
+  add_library(ffmpeg_avformat STATIC IMPORTED)
+  add_library(ffmpeg_avcodec STATIC IMPORTED)
+  add_library(ffmpeg_swresample STATIC IMPORTED)
+  add_library(ffmpeg_swscale STATIC IMPORTED)
+  add_library(ffmpeg_avutil STATIC IMPORTED)
+  set_target_properties(ffmpeg_avformat PROPERTIES
+    IMPORTED_LOCATION "${LEGATO_AVFORMAT}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LEGATO_FFMPEG_PREFIX}/include")
+  set_target_properties(ffmpeg_avcodec PROPERTIES
+    IMPORTED_LOCATION "${LEGATO_AVCODEC}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LEGATO_FFMPEG_PREFIX}/include")
+  set_target_properties(ffmpeg_swresample PROPERTIES
+    IMPORTED_LOCATION "${LEGATO_SWRESAMPLE}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LEGATO_FFMPEG_PREFIX}/include")
+  set_target_properties(ffmpeg_swscale PROPERTIES
+    IMPORTED_LOCATION "${LEGATO_SWSCALE}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LEGATO_FFMPEG_PREFIX}/include")
+  set_target_properties(ffmpeg_avutil PROPERTIES
+    IMPORTED_LOCATION "${LEGATO_AVUTIL}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LEGATO_FFMPEG_PREFIX}/include")
+endif()
 
 add_library(legato SHARED
   engine/src/engine.cpp
@@ -93,13 +115,12 @@ if(LEGATO_HAS_FFMPEG)
     codec/src/ffmpeg_sw_decoder.cpp
   )
   target_compile_definitions(legato PRIVATE LEGATO_HAS_FFMPEG=1)
-  target_include_directories(legato PRIVATE "${LEGATO_FFMPEG_PREFIX}/include")
   target_link_libraries(legato PRIVATE
-    "${LEGATO_AVFORMAT}"
-    "${LEGATO_AVCODEC}"
-    "${LEGATO_SWRESAMPLE}"
-    "${LEGATO_SWSCALE}"
-    "${LEGATO_AVUTIL}"
+    ffmpeg_avformat
+    ffmpeg_avcodec
+    ffmpeg_swresample
+    ffmpeg_swscale
+    ffmpeg_avutil
   )
   if(NOT MSVC)
     target_link_libraries(legato PRIVATE m)
@@ -221,6 +242,8 @@ add_test(NAME m05 COMMAND legato_m05_tests)
 add_test(NAME hello COMMAND legato_hello)
 add_test(NAME idlgen
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/idlgen/idlgen.py --check --root ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME ffmpeg_import
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ffmpeg_import.py)
 add_test(NAME symbols
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_symbols.sh $<TARGET_FILE:legato>)
 add_test(NAME synthetic_dry_run
