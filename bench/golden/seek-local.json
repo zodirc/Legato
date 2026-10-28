@@ -1,0 +1,15 @@
+{
+  "scenario": {"id": "seek-local", "hash": "sha256:829381caec3358c465a7ec47c1135c37c519f8baaddf39c14ed37a84c86f799f"},
+  "build": {"commit": "8da4fc661c36", "config": "play-demo", "ffmpeg": "5.1.6", "quirks_db": "none"},
+  "env": {"tier": "T1", "device": "headless", "os": "linux", "backend": "legato", "model": "pipeline", "preset": "vod", "simulated_network": false, "network_trace": ""},
+  "runs": 1,
+  "metrics": {
+    "seek_error_us": {"unit": "us", "value": 0},
+    "seek_stale_frames": {"unit": "count", "value": 0},
+    "seek_commits": {"unit": "count", "value": 2},
+    "alloc_steady": {"unit": "count", "value": 0}
+  },
+  "events": ["state_changed", "command_done", "command_done", "first_frame", "state_changed", "seek", "command_done", "seek", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done", "command_done"],
+  "presentation_sha256": "de7c56e9c7c8f5130388728bf8bb2a8d332d17722a2a54873e1324a1d2602f77",
+  "gates": {"alloc_steady_eq_0": true, "av_sync_p95_lt_40ms": true}
+}

@@ -1,0 +1,24 @@
+id: seek-local
+preset: vod
+tier: T1
+media:
+  uri: corpus://startup/local-1080p-h264
+seek_tolerance_us: 34000
+max_seek_commits: 8
+repetitions: 1
+warmup: 0
+metrics:
+  - seek_error_us
+  - seek_stale_frames
+  - seek_commits
+  - alloc_steady
+actions:
+  - load
+  - play
+  - wait_first_frame
+  - seek: 1500ms
+  - watch: 200ms
+  - seek_burst:
+      count: 100
+      to: 10s
+  - watch: 500ms
