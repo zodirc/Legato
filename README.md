@@ -175,7 +175,7 @@ Legato 是跨平台音视频播放引擎。实现语言为 C++20，稳定接口�
 
 ### 2.4 URI
 - `uri` <- `legato_media_item.uri` <- `legato_player_load`
-- `local_file_path` 去掉 `file://` 前缀及可选的 `localhost`。盘符形式 `file:///C:/a.mp4` 得到 `C:/a.mp4`，`file://host/share` 得到 `//host/share`
+- `local_file_path` 去掉 `file://` 前缀及可选的 `localhost`。盘符形式 `file:///C:/a.mp4` 得到 `C:/a.mp4`，`file://host/share` 得到 `//host/share`。`file://` 先把 `%HH` 解成字节，`file:///tmp/a%20b.mp4` 得到 `/tmp/a b.mp4`。无 scheme 的路径不解码。半截、非十六进制和 `%00` 原样保留。
 - `corpus://...` <- `resolve_corpus` <- `legato_engine_create` 的 `corpus_root` 下核对 `testdata/corpus.yaml` 后得到媒体路径
 - `http://` 与 `https://` <- `HttpSource` <- libcurl。播放用的 FFmpeg 仍关闭网络
 - 登记的 scheme <- `CallbackSource` <- `legato_register_source`

@@ -145,6 +145,22 @@ void test_errors() {
     CHECK(legato::local_file_path("file://server/share/a.mp4", path, sizeof(path)) == 1);
     CHECK(std::strcmp(path, "//server/share/a.mp4") == 0);
     CHECK(legato::local_file_path("corpus://startup/local-1080p-h264", path, sizeof(path)) == 0);
+    CHECK(legato::local_file_path("file:///tmp/a%20b.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/a b.mp4") == 0);
+    CHECK(legato::local_file_path("file:///C:/a%20b.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "C:/a b.mp4") == 0);
+    CHECK(legato::local_file_path("file://server/share/a%20b.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "//server/share/a b.mp4") == 0);
+    CHECK(legato::local_file_path("file:///%43%3A/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "C:/a.mp4") == 0);
+    CHECK(legato::local_file_path("file:///tmp/100%25x.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/100%x.mp4") == 0);
+    CHECK(legato::local_file_path("file:///tmp/a%zz.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/a%zz.mp4") == 0);
+    CHECK(legato::local_file_path("file:///tmp/a%00b.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/a%00b.mp4") == 0);
+    CHECK(legato::local_file_path("/tmp/a%20b.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "/tmp/a%20b.mp4") == 0);
 }
 
 }  /* namespace */
