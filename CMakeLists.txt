@@ -184,7 +184,9 @@ if(NOT LEGATO_GIT_COMMIT)
 endif()
 
 add_executable(legato-bench bench/src/bench_main.cpp)
-target_include_directories(legato-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/src)
+target_include_directories(legato-bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/include)
 target_compile_definitions(legato-bench PRIVATE
   LEGATO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   LEGATO_BUILD_COMMIT="${LEGATO_GIT_COMMIT}"
@@ -244,6 +246,8 @@ add_test(NAME idlgen
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/idlgen/idlgen.py --check --root ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ffmpeg_import
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ffmpeg_import.py)
+add_test(NAME json_format
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_json_format.py)
 add_test(NAME symbols
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_symbols.sh $<TARGET_FILE:legato>)
 add_test(NAME symbols_dumpbin

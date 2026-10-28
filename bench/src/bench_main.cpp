@@ -1,3 +1,4 @@
+#include "legato/core/json_mini.hpp"
 #include "legato/legato.h"
 #include "sha256.hpp"
 #include "yaml_mini.hpp"
@@ -596,9 +597,11 @@ std::string format_result(const Scenario& scenario, const Measured& measured, co
                              ? 0.0
                              : static_cast<double>(measured.reused) / static_cast<double>(measured.presented);
     char reuse_buf[32];
-    std::snprintf(reuse_buf, sizeof(reuse_buf), "%.6f", reuse);
     char stall_buf[32];
-    std::snprintf(stall_buf, sizeof(stall_buf), "%.6f", 0.0);
+    if (!legato::json_fixed6(reuse, reuse_buf, sizeof(reuse_buf)) ||
+        !legato::json_fixed6(0.0, stall_buf, sizeof(stall_buf))) {
+        throw std::runtime_error("json number");
+    }
 
     std::string out;
     out += "{\n";

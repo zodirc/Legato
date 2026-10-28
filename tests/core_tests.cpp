@@ -1,5 +1,6 @@
 #include "legato/core/actor.hpp"
 #include "legato/core/alloc.hpp"
+#include "legato/core/json_mini.hpp"
 #include "legato/core/object_pool.hpp"
 #include "legato/core/spsc_ring.hpp"
 #include "legato/codec/decoder.hpp"
@@ -13,6 +14,7 @@
 #include "legato/render/sink.hpp"
 
 #include <atomic>
+#include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -165,6 +167,39 @@ void test_errors() {
     CHECK(std::strcmp(path, "/tmp/a%20b.mp4") == 0);
 }
 
+void test_json_fixed() {
+    char buf[32];
+    CHECK(legato::json_fixed6(0.0, buf, sizeof(buf)));
+    CHECK(std::strcmp(buf, "0.000000") == 0);
+    CHECK(legato::json_fixed6(0.5, buf, sizeof(buf)));
+    CHECK(std::strcmp(buf, "0.500000") == 0);
+    CHECK(legato::json_fixed6(1.25, buf, sizeof(buf)));
+    CHECK(std::strcmp(buf, "1.250000") == 0);
+    CHECK(legato::json_fixed6(12.0, buf, sizeof(buf)));
+    CHECK(std::strcmp(buf, "12.000000") == 0);
+    CHECK(legato::json_fixed6(-0.5, buf, sizeof(buf)));
+    CHECK(std::strcmp(buf, "-0.500000") == 0);
+    CHECK(!legato::json_fixed6(0.5, buf, 4));
+    const char* names[] = {"en_DK.utf8", "en_DK"};
+    bool comma_locale = false;
+    for (const char* name : names) {
+        if (std::setlocale(LC_NUMERIC, name) != nullptr) {
+            comma_locale = true;
+            break;
+        }
+    }
+    if (comma_locale) {
+        char printf_buf[32];
+        std::snprintf(printf_buf, sizeof(printf_buf), "%.6f", 0.5);
+        CHECK(std::strcmp(printf_buf, "0,500000") == 0);
+        CHECK(legato::json_fixed6(0.5, buf, sizeof(buf)));
+        CHECK(std::strcmp(buf, "0.500000") == 0);
+        CHECK(legato::json_fixed6(0.0, buf, sizeof(buf)));
+        CHECK(std::strcmp(buf, "0.000000") == 0);
+        std::setlocale(LC_NUMERIC, "C");
+    }
+}
+
 void test_win_path() {
     char path[512];
     CHECK(legato::win32_extended_path("C:/a.mp4", path, sizeof(path)) == 1);
@@ -202,6 +237,7 @@ int main() {
     test_alloc();
     test_clock_and_presets();
     test_errors();
+    test_json_fixed();
     test_win_path();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d checks failed\n", g_failures);
