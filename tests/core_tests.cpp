@@ -9,11 +9,13 @@
 #include "legato/engine/preset.hpp"
 #include "legato/io/data_source.hpp"
 #include "legato/pal/clock.hpp"
+#include "legato/pal/win_path.hpp"
 #include "legato/render/sink.hpp"
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 
 namespace {
@@ -163,6 +165,34 @@ void test_errors() {
     CHECK(std::strcmp(path, "/tmp/a%20b.mp4") == 0);
 }
 
+void test_win_path() {
+    char path[512];
+    CHECK(legato::win32_extended_path("C:/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "\\\\?\\C:\\a.mp4") == 0);
+    CHECK(legato::win32_extended_path("C:\\a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "\\\\?\\C:\\a.mp4") == 0);
+    CHECK(legato::win32_extended_path("//server/share/a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "\\\\?\\UNC\\server\\share\\a.mp4") == 0);
+    CHECK(legato::win32_extended_path("\\\\server\\share\\a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "\\\\?\\UNC\\server\\share\\a.mp4") == 0);
+    CHECK(legato::win32_extended_path("foo/bar.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "foo\\bar.mp4") == 0);
+    CHECK(legato::win32_extended_path("C:foo.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "C:foo.mp4") == 0);
+    CHECK(legato::win32_extended_path("\\\\?\\C:\\a.mp4", path, sizeof(path)) == 1);
+    CHECK(std::strcmp(path, "\\\\?\\C:\\a.mp4") == 0);
+    CHECK(legato::win32_extended_path("", path, sizeof(path)) == 0);
+    CHECK(legato::win32_extended_path("//", path, sizeof(path)) == 0);
+    char tiny[8];
+    CHECK(legato::win32_extended_path("C:/abcdef.mp4", tiny, sizeof(tiny)) == -1);
+    std::string long_path = "C:/";
+    long_path.append(300, 'a');
+    long_path += ".mp4";
+    CHECK(legato::win32_extended_path(long_path.c_str(), path, sizeof(path)) == 1);
+    CHECK(std::strncmp(path, "\\\\?\\C:\\", 6) == 0);
+    CHECK(std::strchr(path, '/') == nullptr);
+}
+
 }  /* namespace */
 
 int main() {
@@ -172,6 +202,7 @@ int main() {
     test_alloc();
     test_clock_and_presets();
     test_errors();
+    test_win_path();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d checks failed\n", g_failures);
         return 1;

@@ -175,7 +175,7 @@ Legato 是跨平台音视频播放引擎。实现语言为 C++20，稳定接口�
 
 ### 2.4 URI
 - `uri` <- `legato_media_item.uri` <- `legato_player_load`
-- `local_file_path` 去掉 `file://` 前缀及可选的 `localhost`。盘符形式 `file:///C:/a.mp4` 得到 `C:/a.mp4`，`file://host/share` 得到 `//host/share`。`file://` 先把 `%HH` 解成字节，`file:///tmp/a%20b.mp4` 得到 `/tmp/a b.mp4`。无 scheme 的路径不解码。半截、非十六进制和 `%00` 原样保留。
+- `local_file_path` 去掉 `file://` 前缀及可选的 `localhost`。盘符形式 `file:///C:/a.mp4` 得到 `C:/a.mp4`，`file://host/share` 得到 `//host/share`。`file://` 先把 `%HH` 解成字节，`file:///tmp/a%20b.mp4` 得到 `/tmp/a b.mp4`。无 scheme 的路径不解码。半截、非十六进制和 `%00` 原样保留。Windows 打开文件时，`win32_extended_path` 把盘符改成 `\\?\C:\…`，把 UNC 改成 `\\?\UNC\…`，再交给 `CreateFileW`
 - `corpus://...` <- `resolve_corpus` <- `legato_engine_create` 的 `corpus_root` 下核对 `testdata/corpus.yaml` 后得到媒体路径
 - `http://` 与 `https://` <- `HttpSource` <- libcurl。播放用的 FFmpeg 仍关闭网络
 - 登记的 scheme <- `CallbackSource` <- `legato_register_source`
@@ -223,7 +223,7 @@ python3 tools/idlgen/idlgen.py --check
 - `idl/`：属性、命令、事件、错误和预设的声明源。`tools/idlgen/idlgen.py` 生成 `include/legato/legato_idl.h`。
 - `include/legato/`：C ABI 头文件。
 - `core/`：控制线程、单生产者单消费者环、对象池、`tracked_malloc`、日志。
-- `pal/`：单调时钟。
+- `pal/`：单调时钟。Windows 上打开本地文件之前，绝对路径在这里改成 `\\?\` 形式。
 - `io/`、`demux/`、`codec/`、`render/`：`FileSource`、`FFmpegDemuxer`、`FFmpegSwDecoder`、`LinuxAudioSink`、`PipeWireSink`、`AlsaSink`。
 - `engine/`：`Player`、预设、`FilePlayback`。
 - `api/`：C ABI 实现。
@@ -245,7 +245,7 @@ python3 tools/idlgen/idlgen.py --check
 5. wav、mp3、aac，以及含 h264 与 aac 的 mp4，经 `legato_play` 应完成 PCM 输出并打印「结束」。有视频时，SDL2 窗口里的 GL 上下文调用 `legato_render_frame`。没有显示时窗口用 offscreen。
 
 ### 3.5 代码依据
-- URI 分发与错误：`local_file_path`、`begin_load_locked`、`resolve_corpus`、`set_error_locked` <- `engine/include/legato/engine/uri_path.hpp`、`engine/src/player.cpp`、`engine/src/corpus.cpp`
+- URI 分发与错误：`local_file_path`、`win32_extended_path`、`begin_load_locked`、`resolve_corpus`、`set_error_locked` <- `engine/include/legato/engine/uri_path.hpp`、`pal/include/legato/pal/win_path.hpp`、`engine/src/player.cpp`、`engine/src/corpus.cpp`、`io/src/file_source.cpp`
 - 打开、读包、EOS、seek、纯视频调度：`FilePlayback::open`、`audio_out_main`、`stop` <- `engine/src/file_playback.cpp`
 - AVIO 与时间基：`FFmpegDemuxer::open`、`discard_video`、`read_packet`、`seek_us` <- `demux/src/ffmpeg_demuxer.cpp`
 - 重采样残余与 seek 后清空：`pull_delayed`、`flush` <- `codec/src/ffmpeg_sw_decoder.cpp`

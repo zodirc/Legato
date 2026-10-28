@@ -1,11 +1,15 @@
 #include "legato/io/file_source.hpp"
 
 #include "legato/legato_idl.h"
+#include "legato/pal/win_path.hpp"
 
 #include <cstdint>
 #include <cstring>
 
 #if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <stdio.h>
 #include <windows.h>
 #endif
 
@@ -15,14 +19,37 @@ int file_seek(FILE* file, std::int64_t offset, int whence) { return _fseeki64(fi
 
 std::int64_t file_tell(FILE* file) { return _ftelli64(file); }
 
-/* CRT 的 fopen 按 ANSI 代码页解释路径。C ABI 传入的是 UTF-8，这里转成 UTF-16。 */
+/* _wfopen 不接受 \\?\，超过 260 个字符的路径会失败。
+   CreateFileW 打开后把句柄交给 CRT，读和 seek 仍用 FILE，避免两套光标。
+   共享读写与 _wfopen 的 _SH_DENYNO 相同，播放时不独占文件。
+   _open_osfhandle 成功后句柄归 fd，不能再 CloseHandle。 */
 FILE* open_utf8(const char* path) {
-    wchar_t wide[LEGATO_URI_MAX];
-    const int wrote = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, LEGATO_URI_MAX);
+    char extended[LEGATO_URI_MAX + 8];
+    if (legato::win32_extended_path(path, extended, sizeof(extended)) != 1) {
+        return nullptr;
+    }
+    wchar_t wide[LEGATO_URI_MAX + 8];
+    const int wrote = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, extended, -1, wide,
+                                           static_cast<int>(sizeof(wide) / sizeof(wide[0])));
     if (wrote <= 0) {
         return nullptr;
     }
-    return _wfopen(wide, L"rb");
+    HANDLE handle = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_RDONLY | _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(handle);
+        return nullptr;
+    }
+    FILE* file = _fdopen(fd, "rb");
+    if (file == nullptr) {
+        _close(fd);
+        return nullptr;
+    }
+    return file;
 }
 #else
 int file_seek(FILE* file, std::int64_t offset, int whence) {
